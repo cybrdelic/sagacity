@@ -4,8 +4,22 @@ use std::collections::HashMap;
 use std::fs;
 use walkdir::WalkDir;
 
+use colored::*;
+use dialoguer::{theme::ColorfulTheme, Select};
+use indicatif::{ProgressBar, ProgressStyle};
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor};
+use spinners::{Spinner, Spinners};
 use std::env;
 use std::time::Instant;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01"; // Add this line
@@ -120,36 +134,40 @@ async fn summarize_with_claude(
 async fn index_codebase(
     root_dir: &str,
     api_key: &str,
+    pb: &ProgressBar,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    debug_print!("Indexing codebase in directory: {}", root_dir);
     let mut index = HashMap::new();
     let files = scan_codebase(root_dir);
-    debug_print!("Found {} files to index", files.len());
+    pb.set_length(files.len() as u64);
 
     for (i, file_path) in files.iter().enumerate() {
-        debug_print!("Processing file {}/{}: {}", i + 1, files.len(), file_path);
+        pb.set_message(format!(
+            "Processing file {}/{}: {}",
+            i + 1,
+            files.len(),
+            file_path
+        ));
         let content = read_file_contents(&file_path)
             .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
-        debug_print!("File content length: {} characters", content.len());
 
-        let start = Instant::now();
         let summary = match summarize_with_claude(&content, api_key).await {
             Ok(summary) => summary,
-            Err(e) => {
-                debug_print!("Error summarizing file {}: {}", file_path, e);
+            Err(_e) => {
                 format!(
                     "Failed to summarize. File content preview: {}",
                     &content[..std::cmp::min(content.len(), 100)]
                 )
             }
         };
-        let duration = start.elapsed();
-        debug_print!("Summarization took {:?}", duration);
 
         index.insert(file_path.clone(), summary);
+        pb.inc(1);
     }
 
-    debug_print!("Indexing complete. Total files indexed: {}", index.len());
+    pb.finish_with_message(format!(
+        "Indexing complete. Total files indexed: {}",
+        index.len()
+    ));
     Ok(index)
 }
 
@@ -277,109 +295,225 @@ async fn generate_llm_response(
     Ok((answer, is_complete))
 }
 
+use rustyline::Helper;
+
+struct MyHelper {
+    completer: FilenameCompleter,
+}
+
+impl MyHelper {
+    fn new(completer: FilenameCompleter) -> Self {
+        MyHelper { completer }
+    }
+}
+
+impl Highlighter for MyHelper {}
+impl Validator for MyHelper {}
+impl Hinter for MyHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        None
+    }
+}
+
+impl Completer for MyHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
+
+impl Helper for MyHelper {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    debug_print!("Starting application");
+    println!(
+        "{}",
+        "Welcome to the Enhanced Codebase Explorer!".bold().green()
+    );
     let root_dir = "."; // Current directory
-    debug_print!("Root directory: {}", root_dir);
+    println!("Root directory: {}", root_dir.cyan());
 
     let api_key = get_claude_api_key()?;
-    debug_print!("API key retrieved successfully");
+    println!("{}", "API key retrieved successfully".green());
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Indexing codebase...");
 
     let start = Instant::now();
-    let index = index_codebase(root_dir, &api_key).await?;
+    let index = index_codebase(root_dir, &api_key, &pb).await?;
     let duration = start.elapsed();
-    debug_print!("Indexing completed in {:?}", duration);
+    pb.finish_with_message(format!("Indexing completed in {:?}", duration));
 
-    println!("Codebase indexed successfully. You can now ask questions about the codebase.");
-    debug_print!("Number of indexed files: {}", index.len());
+    println!(
+        "{}",
+        "Codebase indexed successfully. You can now explore the codebase."
+            .bold()
+            .green()
+    );
+    println!(
+        "Number of indexed files: {}",
+        index.len().to_string().yellow()
+    );
+
+    let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
+    rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
 
     loop {
-        println!("Enter your query ('print index' to see all entries, 'chat' to start a chat session, or 'quit' to exit):");
-        let mut query = String::new();
-        std::io::stdin().read_line(&mut query)?;
-        let query = query.trim();
-        debug_print!("User query: {}", query);
+        let choices = vec!["Search", "Chat", "Print Index", "Quit"];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Choose an action")
+            .default(0)
+            .items(&choices)
+            .interact()?;
 
-        match query.to_lowercase().as_str() {
-            "quit" => {
-                debug_print!("Exiting application");
+        match selection {
+            0 => search_mode(&index, &mut rl)?,
+            1 => chat_mode(&index, &api_key, &mut rl).await?,
+            2 => print_index(&index),
+            3 => {
+                println!("{}", "Exiting application. Goodbye!".bold().green());
                 break;
             }
-            "print index" => {
-                println!("Full index:");
-                for (file, summary) in &index {
-                    println!("File: {}\nSummary: {}\n", file, summary);
-                }
-            }
-            "chat" => {
-                println!("Starting chat session. Type 'exit' to end the chat.");
-                let mut conversation_history: Vec<Value> = Vec::new();
-                loop {
-                    println!("Chat: Enter your question about the codebase:");
-                    let mut chat_query = String::new();
-                    std::io::stdin().read_line(&mut chat_query)?;
-                    let mut chat_query = chat_query.trim().to_string();
-
-                    if chat_query.to_lowercase() == "exit" {
-                        println!("Ending chat session.");
-                        break;
-                    }
-
-                    let mut is_complete = false;
-                    while !is_complete {
-                        match chat_with_system(
-                            &index,
-                            &api_key,
-                            &chat_query,
-                            &mut conversation_history,
-                        )
-                        .await
-                        {
-                            Ok((response, complete)) => {
-                                println!("System: {}", response);
-                                is_complete = complete;
-                                if !is_complete {
-                                    println!("The response was incomplete. Type 'continue' to get the rest of the response, or 'skip' to move on:");
-                                    let mut user_choice = String::new();
-                                    std::io::stdin().read_line(&mut user_choice)?;
-                                    let user_choice = user_choice.trim().to_lowercase();
-
-                                    if user_choice == "continue" {
-                                        chat_query =
-                                            "Please continue your previous response.".to_string();
-                                    } else if user_choice == "skip" {
-                                        break;
-                                    } else {
-                                        println!(
-                                            "Invalid choice. Please type 'continue' or 'skip'."
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("Error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                let results = search_index(&index, query);
-                debug_print!("Search results count: {}", results.len());
-                if results.is_empty() {
-                    println!("No results found for your query.");
-                } else {
-                    println!("Search results:");
-                    for (file, summary) in results {
-                        println!("File: {}\nSummary: {}\n", file, summary);
-                    }
-                }
-            }
+            _ => unreachable!(),
         }
     }
 
     Ok(())
 }
+
+fn search_mode(
+    index: &HashMap<String, String>,
+    rl: &mut Editor<MyHelper, DefaultHistory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let query = rl.readline("Enter your search query (or 'back' to return to main menu): ")?;
+        let query = query.trim();
+
+        if query.to_lowercase() == "back" {
+            break;
+        }
+
+        let results: Vec<(String, String)> = search_index(index, query);
+        if results.is_empty() {
+            println!("{}", "No results found for your query.".yellow());
+        } else {
+            println!("{}", format!("Found {} results:", results.len()).green());
+            for (i, (file, summary)) in results.iter().enumerate() {
+                println!("{}. {}", (i + 1).to_string().cyan(), file.bold());
+                println!("   {}", summary);
+            }
+
+            println!(
+                "\nEnter the number of a file to view its contents, or press Enter to continue:"
+            );
+            let choice = rl.readline("> ")?.trim().to_string();
+            if let Ok(index) = choice.parse::<usize>() {
+                if index > 0 && index <= results.len() {
+                    if let Some((file, _)) = results.get(index - 1) {
+                        view_file_contents(file)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn chat_mode(
+    index: &HashMap<String, String>,
+    api_key: &str,
+    rl: &mut Editor<MyHelper, DefaultHistory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        "Starting chat session. Type 'exit' to end the chat."
+            .bold()
+            .green()
+    );
+    let mut conversation_history: Vec<Value> = Vec::new();
+
+    loop {
+        let chat_query = rl.readline("Chat: Enter your question about the codebase: ")?;
+        let chat_query = chat_query.trim();
+
+        if chat_query.to_lowercase() == "exit" {
+            println!("{}", "Ending chat session.".yellow());
+            break;
+        }
+
+        let mut spinner = Spinner::new(Spinners::Dots9, "Thinking...".into());
+        let (response, is_complete) =
+            chat_with_system(index, api_key, chat_query, &mut conversation_history).await?;
+        spinner.stop();
+
+        println!("{}", "System:".bold().green());
+        println!("{}", response);
+
+        if !is_complete {
+            let choice = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("The response was incomplete. What would you like to do?")
+                .default(0)
+                .items(&["Continue", "Skip"])
+                .interact()?;
+
+            if choice == 0 {
+                let mut spinner = Spinner::new(Spinners::Dots9, "Continuing...".into());
+                let (additional_response, _) = chat_with_system(
+                    index,
+                    api_key,
+                    "Please continue your previous response.",
+                    &mut conversation_history,
+                )
+                .await?;
+                spinner.stop();
+                println!("{}", "System (continued):".bold().green());
+                println!("{}", additional_response);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_index(index: &HashMap<String, String>) {
+    println!("{}", "Full index:".bold().green());
+    for (file, summary) in index {
+        println!("{}", file.bold());
+        println!("{}\n", summary);
+    }
+}
+
+fn view_file_contents(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let content = read_file_contents(file_path)?;
+
+    let ss = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+    let syntax = ss
+        .find_syntax_for_file(file_path)?
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
+
+    println!("{}", format!("Contents of {}:", file_path).bold().green());
+    for line in LinesWithEndings::from(&content) {
+        let ranges: Vec<(Style, &str)> = h.highlight_line(line, &ss)?;
+        let escaped = as_24_bit_terminal_escaped(&ranges[..], true);
+        print!("{}", escaped);
+    }
+    println!();
+    Ok(())
+}
+
+
