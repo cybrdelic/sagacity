@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use walkdir::WalkDir;
 
+use futures::future::join_all;
 use std::env;
 use std::time::Instant;
 
@@ -74,10 +75,10 @@ async fn summarize_with_claude(
             "messages": [
                 {
                     "role": "user",
-                    "content": format!("Summarize the following code:\n\n{}", content)
+                    "content": format!("Provide a very concise summary (2-3 sentences max) of the following code, focusing on its main purpose and key functionalities:\n\n{}", content)
                 }
             ],
-            "max_tokens": 1000
+            "max_tokens": 150
         }))
         .send()
         .await
@@ -166,6 +167,75 @@ fn search_index(index: &HashMap<String, String>, query: &str) -> Vec<(String, St
         .collect()
 }
 
+async fn chat_with_system(
+    index: &HashMap<String, String>,
+    api_key: &str,
+    user_query: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    debug_print!("Starting chat with system");
+
+    // Step 1: Find relevant files
+    let relevant_files = search_index(index, user_query);
+
+    // Step 2: Prepare context for the LLM
+    let context = prepare_context(&relevant_files, user_query);
+
+    // Step 3: Generate response using the LLM
+    let response = generate_llm_response(&context, api_key).await?;
+
+    Ok(response)
+}
+
+fn prepare_context(relevant_files: &[(String, String)], user_query: &str) -> String {
+    let mut context = format!(
+        "User query: {}\n\nRelevant files and summaries:\n",
+        user_query
+    );
+    for (file, summary) in relevant_files {
+        context.push_str(&format!("File: {}\nSummary: {}\n\n", file, summary));
+    }
+    context
+}
+
+async fn generate_llm_response(
+    context: &str,
+    api_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    debug_print!("Generating LLM response");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-sonnet-20240229",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": format!("Based on the following context about a codebase, please answer the user's query:\n\n{}", context)
+                }
+            ],
+            "max_tokens": 500
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+
+    let answer = body["content"][0]["text"]
+        .as_str()
+        .ok_or("Missing 'text' field in API response")?
+        .trim()
+        .to_string();
+
+    Ok(answer)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug_print!("Starting application");
@@ -184,29 +254,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug_print!("Number of indexed files: {}", index.len());
 
     loop {
-        println!("Enter your query ('print index' to see all entries, or 'quit' to exit):");
+        println!("Enter your query ('print index' to see all entries, 'chat' to start a chat session, or 'quit' to exit):");
         let mut query = String::new();
         std::io::stdin().read_line(&mut query)?;
         let query = query.trim();
         debug_print!("User query: {}", query);
 
-        if query.to_lowercase() == "quit" {
-            debug_print!("Exiting application");
-            break;
-        } else if query.to_lowercase() == "print index" {
-            println!("Full index:");
-            for (file, summary) in &index {
-                println!("File: {}\nSummary: {}\n", file, summary);
+        match query.to_lowercase().as_str() {
+            "quit" => {
+                debug_print!("Exiting application");
+                break;
             }
-        } else {
-            let results = search_index(&index, query);
-            debug_print!("Search results count: {}", results.len());
-            if results.is_empty() {
-                println!("No results found for your query.");
-            } else {
-                println!("Search results:");
-                for (file, summary) in results {
+            "print index" => {
+                println!("Full index:");
+                for (file, summary) in &index {
                     println!("File: {}\nSummary: {}\n", file, summary);
+                }
+            }
+            "chat" => {
+                println!("Starting chat session. Type 'exit' to end the chat.");
+                loop {
+                    println!("Chat: Enter your question about the codebase:");
+                    let mut chat_query = String::new();
+                    std::io::stdin().read_line(&mut chat_query)?;
+                    let chat_query = chat_query.trim();
+
+                    if chat_query.to_lowercase() == "exit" {
+                        println!("Ending chat session.");
+                        break;
+                    }
+
+                    match chat_with_system(&index, &api_key, chat_query).await {
+                        Ok(response) => println!("System: {}", response),
+                        Err(e) => println!("Error: {}", e),
+                    }
+                }
+            }
+            _ => {
+                let results = search_index(&index, query);
+                debug_print!("Search results count: {}", results.len());
+                if results.is_empty() {
+                    println!("No results found for your query.");
+                } else {
+                    println!("Search results:");
+                    for (file, summary) in results {
+                        println!("File: {}\nSummary: {}\n", file, summary);
+                    }
                 }
             }
         }
