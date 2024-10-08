@@ -14,7 +14,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
 use std::env;
-use std::io::{self, stdout, Write};
+use std::io::{self, Write};
 use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
@@ -26,6 +26,22 @@ use termimad::crossterm::{
     terminal::{Clear, ClearType},
 };
 use termimad::MadSkin;
+// Unicode box-drawing characters
+const LIGHT_DOWN_AND_RIGHT: char = '┌';
+const LIGHT_DOWN_AND_LEFT: char = '┐';
+const LIGHT_UP_AND_RIGHT: char = '└';
+const LIGHT_UP_AND_LEFT: char = '┘';
+const LIGHT_VERTICAL_AND_RIGHT: char = '├';
+const LIGHT_VERTICAL_AND_LEFT: char = '┤';
+const LIGHT_HORIZONTAL: char = '─';
+const LIGHT_VERTICAL: char = '│';
+
+const HEAVY_DOWN_AND_RIGHT: char = '┏';
+const HEAVY_DOWN_AND_LEFT: char = '┓';
+const HEAVY_UP_AND_RIGHT: char = '┗';
+const HEAVY_UP_AND_LEFT: char = '┛';
+const HEAVY_HORIZONTAL: char = '━';
+const HEAVY_VERTICAL: char = '┃';
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01"; // Add this line
@@ -342,12 +358,10 @@ impl Helper for MyHelper {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        "Welcome to the Enhanced Codebase Explorer!".bold().green()
-    );
+    print_header("Welcome to the Enhanced Codebase Explorer");
     let root_dir = "."; // Current directory
-    println!("Root directory: {}", root_dir.cyan());
+    println!("{}", "Root directory:".bold());
+    println!("  {}", root_dir.cyan());
 
     let api_key = get_claude_api_key()?;
     println!("{}", "API key retrieved successfully".green());
@@ -410,19 +424,23 @@ async fn chat_mode(
     let mut conversation_history: Vec<Value> = Vec::new();
 
     loop {
-        let chat_query = rl.readline(
-            "Enter your question (or type '/exit' to end chat, '/help' for commands): ",
-        )?;
+        print_header("Chat Mode");
+        let chat_query = rl.readline(&format!(
+            "{} ",
+            "Enter your question (or type '/exit' to end chat, '/help' for commands):"
+                .bold()
+                .yellow()
+        ))?;
         let chat_query = chat_query.trim();
 
         match chat_query {
             "/exit" => {
-                println!("Ending chat session.");
+                println!("{}", "Ending chat session.".bold().green());
                 break;
             }
             "/clear" => {
                 conversation_history.clear();
-                println!("Conversation history cleared.");
+                println!("{}", "Conversation history cleared.".bold().green());
                 continue;
             }
             "/help" => {
@@ -440,9 +458,19 @@ async fn chat_mode(
             _ => {}
         }
 
-        println!("AI is thinking...");
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        pb.set_message("AI is thinking...");
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+
         let response =
             chat_with_system(index, api_key, chat_query, &mut conversation_history).await?;
+
+        pb.finish_and_clear();
 
         conversation_history.push(json!({
             "role": "user",
@@ -453,14 +481,50 @@ async fn chat_mode(
             "content": response.clone()
         }));
 
-        println!("AI: {}", response);
+        println!(
+            "{}",
+            LIGHT_DOWN_AND_RIGHT.to_string()
+                + &LIGHT_HORIZONTAL.to_string().repeat(58)
+                + &LIGHT_DOWN_AND_LEFT.to_string()
+        );
+        println!(
+            "{} {: <56} {}",
+            LIGHT_VERTICAL,
+            "You:".bold().blue(),
+            LIGHT_VERTICAL
+        );
+        for line in textwrap::wrap(chat_query, 56) {
+            println!("{} {: <56} {}", LIGHT_VERTICAL, line, LIGHT_VERTICAL);
+        }
+        println!(
+            "{}",
+            LIGHT_VERTICAL_AND_RIGHT.to_string()
+                + &LIGHT_HORIZONTAL.to_string().repeat(58)
+                + &LIGHT_VERTICAL_AND_LEFT.to_string()
+        );
+        println!(
+            "{} {: <56} {}",
+            LIGHT_VERTICAL,
+            "AI:".bold().green(),
+            LIGHT_VERTICAL
+        );
+        for line in textwrap::wrap(&response, 56) {
+            println!("{} {: <56} {}", LIGHT_VERTICAL, line, LIGHT_VERTICAL);
+        }
+        println!(
+            "{}",
+            LIGHT_UP_AND_RIGHT.to_string()
+                + &LIGHT_HORIZONTAL.to_string().repeat(58)
+                + &LIGHT_UP_AND_LEFT.to_string()
+        );
+        println!();
     }
     Ok(())
 }
 
 use textwrap::wrap;
 
-fn display_conversation(conversation_history: &[Value], skin: &MadSkin) -> io::Result<()> {
+fn display_conversation(conversation_history: &[Value], _skin: &MadSkin) -> io::Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, Clear(ClearType::All))?;
 
@@ -548,13 +612,32 @@ fn display_typing_indicator(skin: &MadSkin) -> io::Result<()> {
 }
 
 fn display_help() {
-    println!("Available Commands:");
-    println!("- /exit: End the chat session");
-    println!("- /clear: Clear the conversation history");
-    println!("- /help: Display this help message");
-    println!("- /save: Save the current conversation");
-    println!("- /load: Load a previously saved conversation");
-    println!("\nType your questions normally to chat with the AI about the codebase.");
+    print_header("Help Menu");
+    println!("{}", "Available Commands:".bold().yellow());
+    println!("  {} {}", "/exit:".bold(), "End the chat session");
+    println!(
+        "  {} {}",
+        "/clear:".bold(),
+        "Clear the conversation history"
+    );
+    println!("  {} {}", "/help:".bold(), "Display this help message");
+    println!("  {} {}", "/save:".bold(), "Save the current conversation");
+    println!(
+        "  {} {}",
+        "/load:".bold(),
+        "Load a previously saved conversation"
+    );
+    println!("\n{}", "Chat Instructions:".bold().yellow());
+    println!("  Type your questions normally to chat with the AI about the codebase.");
+    println!("  The AI will provide information based on the indexed files and your queries.");
+    println!("\n{}", "Navigation:".bold().yellow());
+    println!("  Use the arrow keys to navigate through previous commands.");
+    println!("  Press Enter to submit your query or command.");
+    println!("\n{}", "Tips:".bold().yellow());
+    println!("  - Be specific in your questions to get more accurate responses.");
+    println!("  - Use '/save' regularly to keep a backup of your conversation.");
+    println!("  - If you're lost, use '/clear' to start a fresh conversation.");
+    println!();
 }
 
 fn save_conversation(conversation_history: &[Value]) -> std::io::Result<()> {
@@ -571,11 +654,37 @@ fn load_conversation() -> std::io::Result<Vec<Value>> {
     Ok(conversation_history)
 }
 
+fn print_header(title: &str) {
+    let width = 60;
+    println!(
+        "{}",
+        HEAVY_DOWN_AND_RIGHT.to_string()
+            + &HEAVY_HORIZONTAL.to_string().repeat(width - 2)
+            + &HEAVY_DOWN_AND_LEFT.to_string()
+    );
+    println!(
+        "{} {: ^width$} {}",
+        HEAVY_VERTICAL,
+        title.bold().green(),
+        HEAVY_VERTICAL
+    );
+    println!(
+        "{}",
+        HEAVY_UP_AND_RIGHT.to_string()
+            + &HEAVY_HORIZONTAL.to_string().repeat(width - 2)
+            + &HEAVY_UP_AND_LEFT.to_string()
+    );
+}
+
 fn print_index(index: &HashMap<String, String>) {
-    println!("{}", "Full index:".bold().green());
+    print_header("Index Browsing Mode");
     for (file, summary) in index {
-        println!("{}", file.bold());
-        println!("{}\n", summary);
+        println!("{}", file.bold().blue());
+        println!("{}", LIGHT_VERTICAL);
+        for line in textwrap::wrap(summary, 80) {
+            println!("{}  {}", LIGHT_VERTICAL, line);
+        }
+        println!("{}\n", LIGHT_VERTICAL);
     }
 }
 
