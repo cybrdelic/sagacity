@@ -170,7 +170,8 @@ async fn chat_with_system(
     index: &HashMap<String, String>,
     api_key: &str,
     user_query: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+    conversation_history: &mut Vec<Value>,
+) -> Result<(String, bool), Box<dyn std::error::Error>> {
     debug_print!("Starting chat with system");
 
     // Step 1: Find relevant files
@@ -184,9 +185,10 @@ async fn chat_with_system(
     let context = prepare_context(&relevant_file_paths, user_query)?;
 
     // Step 4: Generate response using the LLM
-    let response = generate_llm_response(&context, api_key).await?;
+    let (response, is_complete) =
+        generate_llm_response(&context, api_key, conversation_history, user_query).await?;
 
-    Ok(response)
+    Ok((response, is_complete))
 }
 
 fn prepare_context(
@@ -207,9 +209,27 @@ fn prepare_context(
 async fn generate_llm_response(
     context: &str,
     api_key: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+    conversation_history: &mut Vec<Value>,
+    user_query: &str,
+) -> Result<(String, bool), Box<dyn std::error::Error>> {
     debug_print!("Generating LLM response");
     let client = reqwest::Client::new();
+
+    let mut messages = conversation_history.clone();
+    if messages.is_empty() || messages.last().unwrap()["role"] != "user" {
+        messages.push(json!({
+            "role": "user",
+            "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
+        }));
+    } else {
+        // If the last message is already from the user, update its content
+        let last_index = messages.len() - 1;
+        messages[last_index] = json!({
+            "role": "user",
+            "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
+        });
+    }
+
     let response = client
         .post(CLAUDE_API_URL)
         .header("Content-Type", "application/json")
@@ -217,12 +237,7 @@ async fn generate_llm_response(
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": format!("Based on the following context about a codebase, please answer the user's query:\n\n{}", context)
-                }
-            ],
+            "messages": messages,
             "max_tokens": 500
         }))
         .send()
@@ -234,13 +249,32 @@ async fn generate_llm_response(
         .await
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
+    debug_print!("API Response: {:?}", body);
+
     let answer = body["content"][0]["text"]
         .as_str()
-        .ok_or("Missing 'text' field in API response")?
+        .ok_or_else(|| {
+            debug_print!("Missing 'text' field in API response: {:?}", body);
+            "Missing 'text' field in API response"
+        })?
         .trim()
         .to_string();
 
-    Ok(answer)
+    let is_complete = !body["stop_reason"].is_null() && body["stop_reason"] == "stop_sequence";
+
+    // Update conversation history
+    if conversation_history.is_empty() || conversation_history.last().unwrap()["role"] != "user" {
+        conversation_history.push(json!({
+            "role": "user",
+            "content": user_query
+        }));
+    }
+    conversation_history.push(json!({
+        "role": "assistant",
+        "content": answer.clone()
+    }));
+
+    Ok((answer, is_complete))
 }
 
 #[tokio::main]
@@ -280,20 +314,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "chat" => {
                 println!("Starting chat session. Type 'exit' to end the chat.");
+                let mut conversation_history: Vec<Value> = Vec::new();
                 loop {
                     println!("Chat: Enter your question about the codebase:");
                     let mut chat_query = String::new();
                     std::io::stdin().read_line(&mut chat_query)?;
-                    let chat_query = chat_query.trim();
+                    let mut chat_query = chat_query.trim().to_string();
 
                     if chat_query.to_lowercase() == "exit" {
                         println!("Ending chat session.");
                         break;
                     }
 
-                    match chat_with_system(&index, &api_key, chat_query).await {
-                        Ok(response) => println!("System: {}", response),
-                        Err(e) => println!("Error: {}", e),
+                    let mut is_complete = false;
+                    while !is_complete {
+                        match chat_with_system(
+                            &index,
+                            &api_key,
+                            &chat_query,
+                            &mut conversation_history,
+                        )
+                        .await
+                        {
+                            Ok((response, complete)) => {
+                                println!("System: {}", response);
+                                is_complete = complete;
+                                if !is_complete {
+                                    println!("The response was incomplete. Type 'continue' to get the rest of the response, or 'skip' to move on:");
+                                    let mut user_choice = String::new();
+                                    std::io::stdin().read_line(&mut user_choice)?;
+                                    let user_choice = user_choice.trim().to_lowercase();
+
+                                    if user_choice == "continue" {
+                                        chat_query =
+                                            "Please continue your previous response.".to_string();
+                                    } else if user_choice == "skip" {
+                                        break;
+                                    } else {
+                                        println!(
+                                            "Invalid choice. Please type 'continue' or 'skip'."
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("Error: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
