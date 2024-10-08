@@ -84,7 +84,10 @@ fn scan_codebase(root_dir: &str) -> Vec<String> {
         .filter(|entry| entry.file_type().is_file())
         .filter(|entry| {
             let extension = entry.path().extension().and_then(|e| e.to_str());
-            matches!(extension, Some("rs") | Some("toml") | Some("md"))
+            matches!(
+                extension,
+                Some("rs") | Some("toml") | Some("md") | Some("py") | Some("go")
+            )
         })
         .map(|entry| entry.path().to_string_lossy().to_string())
         .collect()
@@ -97,20 +100,25 @@ fn read_file_contents(file_path: &str) -> Result<String, std::io::Error> {
 async fn summarize_with_claude(
     content: &str,
     api_key: &str,
+    language: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     debug_print!("Summarizing content with Claude");
     let client = reqwest::Client::new();
+    let prompt = format!(
+        "Provide a very concise summary (2-3 sentences max) of the following {} code, focusing on its main purpose and key functionalities:\n\n{}",
+        language, content
+    );
     let response = client
         .post(CLAUDE_API_URL)
         .header("Content-Type", "application/json")
         .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION) // Add this line
+        .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": [
                 {
                     "role": "user",
-                    "content": format!("Provide a very concise summary (2-3 sentences max) of the following code, focusing on its main purpose and key functionalities:\n\n{}", content)
+                    "content": prompt
                 }
             ],
             "max_tokens": 4000
@@ -157,7 +165,7 @@ async fn index_codebase(
     root_dir: &str,
     api_key: &str,
     pb: &ProgressBar,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, (String, String)>, Box<dyn std::error::Error>> {
     let mut index = HashMap::new();
     let files = scan_codebase(root_dir);
     pb.set_length(files.len() as u64);
@@ -172,7 +180,8 @@ async fn index_codebase(
         let content = read_file_contents(&file_path)
             .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
 
-        let summary = match summarize_with_claude(&content, api_key).await {
+        let language = detect_language(&file_path);
+        let summary = match summarize_with_claude(&content, api_key, &language).await {
             Ok(summary) => summary,
             Err(_e) => {
                 format!(
@@ -182,7 +191,7 @@ async fn index_codebase(
             }
         };
 
-        index.insert(file_path.clone(), summary);
+        index.insert(file_path.clone(), (summary, language));
         pb.inc(1);
     }
 
@@ -193,10 +202,25 @@ async fn index_codebase(
     Ok(index)
 }
 
-fn search_index(index: &HashMap<String, String>, query: &str) -> Vec<(String, f32)> {
+fn detect_language(file_path: &str) -> String {
+    let extension = std::path::Path::new(file_path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
+
+    match extension {
+        "rs" => "rust",
+        "py" => "python",
+        "go" => "go",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn search_index(index: &HashMap<String, (String, String)>, query: &str) -> Vec<(String, f32)> {
     let mut relevant_files = Vec::new();
-    for (file, summary) in index {
-        let relevance = calculate_relevance(summary, query);
+    for (file, (summary, language)) in index {
+        let relevance = calculate_relevance(summary, query, language);
         if relevance > 0.0 {
             relevant_files.push((file.clone(), relevance));
         }
@@ -206,21 +230,42 @@ fn search_index(index: &HashMap<String, String>, query: &str) -> Vec<(String, f3
     relevant_files
 }
 
-fn calculate_relevance(summary: &str, query: &str) -> f32 {
+fn calculate_relevance(summary: &str, query: &str, language: &str) -> f32 {
     let summary_words: Vec<&str> = summary.split_whitespace().collect();
     let query_words: Vec<&str> = query.split_whitespace().collect();
+
+    let language_keywords = match language {
+        "rust" => vec!["struct", "impl", "fn", "let", "mut", "trait", "enum"],
+        "python" => vec![
+            "def", "class", "import", "from", "if", "elif", "else", "for", "while",
+        ],
+        "go" => vec![
+            "func",
+            "type",
+            "struct",
+            "interface",
+            "package",
+            "import",
+            "var",
+            "const",
+        ],
+        _ => vec![],
+    };
 
     let mut relevance = 0.0;
     for query_word in &query_words {
         if summary_words.contains(query_word) {
             relevance += 1.0;
         }
+        if language_keywords.contains(query_word) {
+            relevance += 0.5;
+        }
     }
     relevance / query_words.len() as f32
 }
 
 async fn chat_with_system(
-    index: &HashMap<String, String>,
+    index: &HashMap<String, (String, String)>,
     api_key: &str,
     user_query: &str,
     conversation_history: &mut Vec<Value>,
@@ -230,12 +275,17 @@ async fn chat_with_system(
     // Step 1: Find relevant files
     let relevant_files = search_index(index, user_query);
 
-    // Step 2: Extract file paths from relevant_files
-    let relevant_file_paths: Vec<String> =
-        relevant_files.into_iter().map(|(file, _)| file).collect();
+    // Step 2: Extract file paths and languages from relevant_files
+    let relevant_file_info: Vec<(String, String)> = relevant_files
+        .into_iter()
+        .map(|(file, _)| {
+            let (_, language) = index.get(&file).unwrap();
+            (file, language.clone())
+        })
+        .collect();
 
     // Step 3: Prepare context for the LLM
-    let context = prepare_context(&relevant_file_paths, user_query)?;
+    let context = prepare_context(&relevant_file_info, user_query)?;
 
     // Step 4: Generate response using the LLM
     let (response, _) =
@@ -255,11 +305,11 @@ async fn chat_with_system(
 }
 
 fn prepare_context(
-    relevant_files: &[String],
+    relevant_files: &[(String, String)],
     user_query: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut context = format!("User query: {}\n\nRelevant file contents:\n", user_query);
-    for file_path in relevant_files {
+    for (file_path, _) in relevant_files {
         let file_content = read_file_contents(file_path)?;
         context.push_str(&format!(
             "File: {}\nContent:\n{}\n\n",
@@ -417,7 +467,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn chat_mode(
-    index: &HashMap<String, String>,
+    index: &HashMap<String, (String, String)>,
     api_key: &str,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -676,9 +726,9 @@ fn print_header(title: &str) {
     );
 }
 
-fn print_index(index: &HashMap<String, String>) {
+fn print_index(index: &HashMap<String, (String, String)>) {
     print_header("Index Browsing Mode");
-    for (file, summary) in index {
+    for (file, (summary, _)) in index {
         println!("{}", file.bold().blue());
         println!("{}", LIGHT_VERTICAL);
         for line in textwrap::wrap(summary, 80) {
