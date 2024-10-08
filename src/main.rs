@@ -387,44 +387,88 @@ async fn get_llm_relevance_score(
     score_str.parse::<f32>().map_err(|e| e.into())
 }
 
+use chrono::{DateTime, Utc};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Message {
+    role: String,
+    content: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    timestamp: DateTime<Utc>,
+}
+
+struct Chatbot {
+    index: HashMap<String, (String, String)>,
+    api_key: String,
+    memory: Vec<Message>,
+}
+
+impl Chatbot {
+    fn new(index: HashMap<String, (String, String)>, api_key: String) -> Self {
+        Chatbot {
+            index,
+            api_key,
+            memory: Vec::new(),
+        }
+    }
+
+    async fn chat(&mut self, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
+        debug_print!("Starting chat with system");
+
+        // Step 1: Find relevant files
+        let relevant_files = search_index(&self.index, user_query, &self.api_key).await;
+
+        // Step 2: Extract file paths and languages from relevant_files
+        let relevant_file_info: Vec<(String, String)> = relevant_files
+            .into_iter()
+            .map(|(file, _)| {
+                let (_, language) = self.index.get(&file).unwrap();
+                (file, language.clone())
+            })
+            .collect();
+
+        // Step 3: Prepare context for the LLM
+        let context = prepare_context(&relevant_file_info, user_query)?;
+
+        // Step 4: Generate response using the LLM
+        let memory_json: Vec<Value> = self
+            .memory
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": m.role,
+                    "content": m.content
+                })
+            })
+            .collect();
+        let (response, _) =
+            generate_llm_response(&context, &self.api_key, &memory_json, user_query).await?;
+
+        // Step 5: Update conversation history
+        self.memory.push(Message {
+            role: "user".to_string(),
+            content: user_query.to_string(),
+            timestamp: Utc::now(),
+        });
+        self.memory.push(Message {
+            role: "assistant".to_string(),
+            content: response.clone(),
+            timestamp: Utc::now(),
+        });
+
+        Ok(response)
+    }
+
+    fn get_last_user_message(&self) -> Option<&Message> {
+        self.memory.iter().rev().find(|m| m.role == "user")
+    }
+}
+
 async fn chat_with_system(
-    index: &HashMap<String, (String, String)>,
-    api_key: &str,
+    chatbot: &mut Chatbot,
     user_query: &str,
-    conversation_history: &mut Vec<Value>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    debug_print!("Starting chat with system");
-
-    // Step 1: Find relevant files
-    let relevant_files = search_index(index, user_query, api_key).await;
-
-    // Step 2: Extract file paths and languages from relevant_files
-    let relevant_file_info: Vec<(String, String)> = relevant_files
-        .into_iter()
-        .map(|(file, _)| {
-            let (_, language) = index.get(&file).unwrap();
-            (file, language.clone())
-        })
-        .collect();
-
-    // Step 3: Prepare context for the LLM
-    let context = prepare_context(&relevant_file_info, user_query)?;
-
-    // Step 4: Generate response using the LLM
-    let (response, _) =
-        generate_llm_response(&context, api_key, conversation_history, user_query).await?;
-
-    // Step 5: Update conversation history
-    conversation_history.push(json!({
-        "role": "user",
-        "content": user_query
-    }));
-    conversation_history.push(json!({
-        "role": "assistant",
-        "content": response.clone()
-    }));
-
-    Ok(response)
+    chatbot.chat(user_query).await
 }
 
 fn prepare_context(
@@ -592,7 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap(),
     );
 
-    let (index, last_modification) = if let Some((cache_timestamp, last_mod, cached_index)) =
+    let (index, _last_modification) = if let Some((cache_timestamp, last_mod, cached_index)) =
         load_index_cache()?
     {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -652,7 +696,7 @@ async fn chat_mode(
     api_key: &str,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conversation_history: Vec<Value> = Vec::new();
+    let mut chatbot = Chatbot::new(index.clone(), api_key.to_string());
 
     loop {
         print_header("Chat Mode");
@@ -670,7 +714,7 @@ async fn chat_mode(
                 break;
             }
             "/clear" => {
-                conversation_history.clear();
+                chatbot.memory.clear();
                 println!("{}", "Conversation history cleared.".bold().green());
                 continue;
             }
@@ -679,11 +723,19 @@ async fn chat_mode(
                 continue;
             }
             "/save" => {
-                save_conversation(&conversation_history)?;
+                save_conversation(&chatbot.memory)?;
                 continue;
             }
             "/load" => {
-                conversation_history = load_conversation()?;
+                chatbot.memory = load_conversation()?;
+                continue;
+            }
+            "/last" => {
+                if let Some(last_message) = chatbot.get_last_user_message() {
+                    println!("Your last message was: {}", last_message.content.cyan());
+                } else {
+                    println!("No previous messages found.");
+                }
                 continue;
             }
             _ => {}
@@ -698,19 +750,9 @@ async fn chat_mode(
         pb.set_message("AI is thinking...");
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        let response =
-            chat_with_system(index, api_key, chat_query, &mut conversation_history).await?;
+        let response = chat_with_system(&mut chatbot, chat_query).await?;
 
         pb.finish_and_clear();
-
-        conversation_history.push(json!({
-            "role": "user",
-            "content": chat_query
-        }));
-        conversation_history.push(json!({
-            "role": "assistant",
-            "content": response.clone()
-        }));
 
         println!(
             "{}",
@@ -897,16 +939,16 @@ fn display_help() {
     println!();
 }
 
-fn save_conversation(conversation_history: &[Value]) -> std::io::Result<()> {
+fn save_conversation(conversation_history: &[Message]) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(conversation_history)?;
     std::fs::write("conversation_history.json", json)?;
     println!("Conversation saved successfully.");
     Ok(())
 }
 
-fn load_conversation() -> std::io::Result<Vec<Value>> {
+fn load_conversation() -> std::io::Result<Vec<Message>> {
     let json = std::fs::read_to_string("conversation_history.json")?;
-    let conversation_history: Vec<Value> = serde_json::from_str(&json)?;
+    let conversation_history: Vec<Message> = serde_json::from_str(&json)?;
     println!("Conversation loaded successfully.");
     Ok(conversation_history)
 }

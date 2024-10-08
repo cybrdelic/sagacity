@@ -19,5 +19,5 @@ termimad = "0.30.0"
 cursor = "2.3.0"
 textwrap = "0.16.1"
 clipboard = "0.5.0"
-chrono = "0.4.38"
+chrono = { version = "0.4.38", features = ["serde"] }
 serde = "1.0.210"
