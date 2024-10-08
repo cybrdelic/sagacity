@@ -18,9 +18,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
 use std::env;
 use std::fs::File;
-use std::io::prelude::*;
 use std::io::{self, Write};
-use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -169,14 +167,17 @@ async fn summarize_with_claude(
 #[derive(Serialize, Deserialize)]
 struct IndexCache {
     timestamp: u64,
+    last_modification: u64,
     index: HashMap<String, (String, String)>,
 }
 
 fn save_index_cache(
     index: &HashMap<String, (String, String)>,
+    last_modification: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cache = IndexCache {
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        last_modification,
         index: index.clone(),
     };
     let serialized = serde_json::to_string(&cache)?;
@@ -185,23 +186,48 @@ fn save_index_cache(
 }
 
 fn load_index_cache(
-) -> Result<Option<(u64, HashMap<String, (String, String)>)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(u64, u64, HashMap<String, (String, String)>)>, Box<dyn std::error::Error>> {
     if let Ok(contents) = fs::read_to_string("index_cache.json") {
         let cache: IndexCache = serde_json::from_str(&contents)?;
-        Ok(Some((cache.timestamp, cache.index)))
+        Ok(Some((
+            cache.timestamp,
+            cache.last_modification,
+            cache.index,
+        )))
     } else {
         Ok(None)
     }
+}
+
+fn check_for_codebase_changes(
+    root_dir: &str,
+    last_modification: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    for entry in WalkDir::new(root_dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
+                    if modified_secs > last_modification {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn index_codebase(
     root_dir: &str,
     api_key: &str,
     pb: &ProgressBar,
-) -> Result<HashMap<String, (String, String)>, Box<dyn std::error::Error>> {
+) -> Result<(HashMap<String, (String, String)>, u64), Box<dyn std::error::Error>> {
     let mut index = HashMap::new();
     let files = scan_codebase(root_dir);
     pb.set_length(files.len() as u64);
+
+    let mut last_modification = 0;
 
     for (i, file_path) in files.iter().enumerate() {
         pb.set_message(format!(
@@ -212,6 +238,14 @@ async fn index_codebase(
         ));
         let content = read_file_contents(&file_path)
             .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
+
+        // Update last_modification time
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            if let Ok(modified) = metadata.modified() {
+                let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
+                last_modification = std::cmp::max(last_modification, modified_secs);
+            }
+        }
 
         let language = detect_language(&file_path);
         let summary = match summarize_with_claude(&content, api_key, &language).await {
@@ -234,9 +268,9 @@ async fn index_codebase(
     ));
 
     // Save the index cache
-    save_index_cache(&index)?;
+    save_index_cache(&index, last_modification)?;
 
-    Ok(index)
+    Ok((index, last_modification))
 }
 
 fn detect_language(file_path: &str) -> String {
@@ -458,6 +492,51 @@ async fn generate_llm_response(
     Ok((answer, is_complete))
 }
 
+async fn generate_organized_filename(
+    api_key: &str,
+    content: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    debug_print!("Generating organized filename");
+    let client = reqwest::Client::new();
+
+    let prompt = format!(
+        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. Include the .txt extension. Only return the filename, nothing else:\n\n{}",
+        content
+    );
+
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-sonnet-20240229",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 100
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+
+    let filename = body["content"][0]["text"]
+        .as_str()
+        .ok_or("Missing 'text' field in API response")?
+        .trim()
+        .to_string();
+
+    Ok(filename)
+}
+
 use rustyline::Helper;
 
 struct MyHelper {
@@ -513,14 +592,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap(),
     );
 
-    let index = if let Some((cache_timestamp, cached_index)) = load_index_cache()? {
+    let (index, last_modification) = if let Some((cache_timestamp, last_mod, cached_index)) =
+        load_index_cache()?
+    {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if current_time - cache_timestamp < 3600 {
-            // Cache is valid for 1 hour
+        if current_time - cache_timestamp < 3600 && !check_for_codebase_changes(root_dir, last_mod)?
+        {
             println!("{}", "Using cached index".green());
-            cached_index
+            (cached_index, last_mod)
         } else {
-            pb.set_message("Cached index outdated. Reindexing codebase...");
+            pb.set_message("Changes detected or cache outdated. Reindexing codebase...");
             index_codebase(root_dir, &api_key, &pb).await?
         }
     } else {
@@ -685,11 +766,7 @@ async fn chat_mode(
                     break;
                 }
                 "s" => {
-                    let filename = format!(
-                        "ai_response_{}.txt",
-                        chrono::Local::now().format("%Y%m%d_%H%M%S")
-                    );
-                    if let Err(e) = save_to_file(&response, &filename) {
+                    if let Err(e) = save_to_file(&response, api_key).await {
                         eprintln!("Failed to save to file: {}", e);
                     }
                     break;
@@ -841,10 +918,14 @@ fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn save_to_file(text: &str, filename: &str) -> std::io::Result<()> {
-    let mut file = File::create(filename)?;
+async fn save_to_file(text: &str, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let filename = generate_organized_filename(api_key, text).await?;
+    let output_dir = "ai_responses";
+    std::fs::create_dir_all(output_dir)?;
+    let file_path = format!("{}/{}", output_dir, filename);
+    let mut file = File::create(&file_path)?;
     file.write_all(text.as_bytes())?;
-    println!("Output saved to file: {}", filename);
+    println!("Output saved to file: {}", file_path);
     Ok(())
 }
 
