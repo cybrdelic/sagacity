@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use walkdir::WalkDir;
 
-use colored::*;
+use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -13,13 +13,19 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
-use spinners::{Spinner, Spinners};
 use std::env;
+use std::io::{self, stdout, Write};
 use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use termimad::crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
+use termimad::MadSkin;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01"; // Add this line
@@ -91,7 +97,7 @@ async fn summarize_with_claude(
                     "content": format!("Provide a very concise summary (2-3 sentences max) of the following code, focusing on its main purpose and key functionalities:\n\n{}", content)
                 }
             ],
-            "max_tokens": 150
+            "max_tokens": 4000
         }))
         .send()
         .await
@@ -189,7 +195,7 @@ async fn chat_with_system(
     api_key: &str,
     user_query: &str,
     conversation_history: &mut Vec<Value>,
-) -> Result<(String, bool), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     debug_print!("Starting chat with system");
 
     // Step 1: Find relevant files
@@ -203,10 +209,20 @@ async fn chat_with_system(
     let context = prepare_context(&relevant_file_paths, user_query)?;
 
     // Step 4: Generate response using the LLM
-    let (response, is_complete) =
+    let (response, _) =
         generate_llm_response(&context, api_key, conversation_history, user_query).await?;
 
-    Ok((response, is_complete))
+    // Step 5: Update conversation history
+    conversation_history.push(json!({
+        "role": "user",
+        "content": user_query
+    }));
+    conversation_history.push(json!({
+        "role": "assistant",
+        "content": response.clone()
+    }));
+
+    Ok(response)
 }
 
 fn prepare_context(
@@ -227,26 +243,17 @@ fn prepare_context(
 async fn generate_llm_response(
     context: &str,
     api_key: &str,
-    conversation_history: &mut Vec<Value>,
+    conversation_history: &Vec<Value>,
     user_query: &str,
 ) -> Result<(String, bool), Box<dyn std::error::Error>> {
     debug_print!("Generating LLM response");
     let client = reqwest::Client::new();
 
     let mut messages = conversation_history.clone();
-    if messages.is_empty() || messages.last().unwrap()["role"] != "user" {
-        messages.push(json!({
-            "role": "user",
-            "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
-        }));
-    } else {
-        // If the last message is already from the user, update its content
-        let last_index = messages.len() - 1;
-        messages[last_index] = json!({
-            "role": "user",
-            "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
-        });
-    }
+    messages.push(json!({
+        "role": "user",
+        "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
+    }));
 
     let response = client
         .post(CLAUDE_API_URL)
@@ -256,7 +263,7 @@ async fn generate_llm_response(
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": messages,
-            "max_tokens": 500
+            "max_tokens":4000
         }))
         .send()
         .await
@@ -279,18 +286,6 @@ async fn generate_llm_response(
         .to_string();
 
     let is_complete = !body["stop_reason"].is_null() && body["stop_reason"] == "stop_sequence";
-
-    // Update conversation history
-    if conversation_history.is_empty() || conversation_history.last().unwrap()["role"] != "user" {
-        conversation_history.push(json!({
-            "role": "user",
-            "content": user_query
-        }));
-    }
-    conversation_history.push(json!({
-        "role": "assistant",
-        "content": answer.clone()
-    }));
 
     Ok((answer, is_complete))
 }
@@ -438,54 +433,168 @@ async fn chat_mode(
     api_key: &str,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        "Starting chat session. Type 'exit' to end the chat."
-            .bold()
-            .green()
-    );
     let mut conversation_history: Vec<Value> = Vec::new();
 
     loop {
-        let chat_query = rl.readline("Chat: Enter your question about the codebase: ")?;
+        let chat_query = rl.readline(
+            "Enter your question (or type '/exit' to end chat, '/help' for commands): ",
+        )?;
         let chat_query = chat_query.trim();
 
-        if chat_query.to_lowercase() == "exit" {
-            println!("{}", "Ending chat session.".yellow());
-            break;
+        match chat_query {
+            "/exit" => {
+                println!("Ending chat session.");
+                break;
+            }
+            "/clear" => {
+                conversation_history.clear();
+                println!("Conversation history cleared.");
+                continue;
+            }
+            "/help" => {
+                display_help();
+                continue;
+            }
+            "/save" => {
+                save_conversation(&conversation_history)?;
+                continue;
+            }
+            "/load" => {
+                conversation_history = load_conversation()?;
+                continue;
+            }
+            _ => {}
         }
 
-        let mut spinner = Spinner::new(Spinners::Dots9, "Thinking...".into());
-        let (response, is_complete) =
+        println!("AI is thinking...");
+        let response =
             chat_with_system(index, api_key, chat_query, &mut conversation_history).await?;
-        spinner.stop();
 
-        println!("{}", "System:".bold().green());
-        println!("{}", response);
+        conversation_history.push(json!({
+            "role": "user",
+            "content": chat_query
+        }));
+        conversation_history.push(json!({
+            "role": "assistant",
+            "content": response.clone()
+        }));
 
-        if !is_complete {
-            let choice = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("The response was incomplete. What would you like to do?")
-                .default(0)
-                .items(&["Continue", "Skip"])
-                .interact()?;
+        println!("AI: {}", response);
+    }
+    Ok(())
+}
 
-            if choice == 0 {
-                let mut spinner = Spinner::new(Spinners::Dots9, "Continuing...".into());
-                let (additional_response, _) = chat_with_system(
-                    index,
-                    api_key,
-                    "Please continue your previous response.",
-                    &mut conversation_history,
-                )
-                .await?;
-                spinner.stop();
-                println!("{}", "System (continued):".bold().green());
-                println!("{}", additional_response);
+use textwrap::wrap;
+
+fn display_conversation(conversation_history: &[Value], skin: &MadSkin) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, Clear(ClearType::All))?;
+
+    let terminal_width = termimad::crossterm::terminal::size()?.0 as usize;
+    let content_width = terminal_width.saturating_sub(4); // Account for minimal indentation
+
+    for message in conversation_history {
+        let role = message["role"].as_str().unwrap_or("unknown");
+        let content = message["content"].as_str().unwrap_or("");
+
+        let formatted_role = match role {
+            "user" => "You:".blue().bold(),
+            "assistant" => "AI:".green().bold(),
+            _ => "Unknown:".yellow().bold(),
+        };
+
+        println!("{}", formatted_role);
+
+        if role == "assistant" {
+            format_ai_response(content, content_width)?;
+        } else {
+            let wrapped_content = wrap(content, content_width);
+            for line in wrapped_content {
+                println!("  {}", line.trim());
+            }
+        }
+        println!();
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
+fn format_ai_response(content: &str, width: usize) -> std::io::Result<()> {
+    let mut in_code_block = false;
+    let mut code_block_content = String::new();
+    let indent = "    ";
+
+    for line in content.lines() {
+        if line.trim().starts_with("```") {
+            if in_code_block {
+                // End of code block, print the collected content
+                println!("{}```", indent);
+                for code_line in code_block_content.lines() {
+                    println!("{}{}", indent, code_line.yellow());
+                }
+                println!("{}```", indent);
+                code_block_content.clear();
+            } else {
+                // Start of code block
+                println!("{}{}", indent, line.trim());
+            }
+            in_code_block = !in_code_block;
+        } else if in_code_block {
+            code_block_content.push_str(line);
+            code_block_content.push('\n');
+        } else {
+            let wrapped_lines = wrap(line.trim(), width.saturating_sub(indent.len()));
+            for wrapped in wrapped_lines {
+                println!("{}{}", indent, wrapped);
             }
         }
     }
+
+    // Handle any remaining code block content
+    if !code_block_content.is_empty() {
+        for code_line in code_block_content.lines() {
+            println!("{}{}", indent, code_line.yellow());
+        }
+        println!("{}```", indent);
+    }
+
     Ok(())
+}
+
+fn display_typing_indicator(skin: &MadSkin) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        MoveTo(0, termimad::crossterm::terminal::size()?.1 - 1)
+    )?;
+    skin.print_text("*System is typing...*");
+    stdout.flush()?;
+    Ok(())
+}
+
+fn display_help() {
+    println!("Available Commands:");
+    println!("- /exit: End the chat session");
+    println!("- /clear: Clear the conversation history");
+    println!("- /help: Display this help message");
+    println!("- /save: Save the current conversation");
+    println!("- /load: Load a previously saved conversation");
+    println!("\nType your questions normally to chat with the AI about the codebase.");
+}
+
+fn save_conversation(conversation_history: &[Value]) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(conversation_history)?;
+    std::fs::write("conversation_history.json", json)?;
+    println!("Conversation saved successfully.");
+    Ok(())
+}
+
+fn load_conversation() -> std::io::Result<Vec<Value>> {
+    let json = std::fs::read_to_string("conversation_history.json")?;
+    let conversation_history: Vec<Value> = serde_json::from_str(&json)?;
+    println!("Conversation loaded successfully.");
+    Ok(conversation_history)
 }
 
 fn print_index(index: &HashMap<String, String>) {
@@ -515,5 +624,3 @@ fn view_file_contents(file_path: &str) -> Result<(), Box<dyn std::error::Error>>
     println!();
     Ok(())
 }
-
-
