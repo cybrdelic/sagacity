@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use walkdir::WalkDir;
 
-use futures::future::join_all;
 use std::env;
 use std::time::Instant;
 
@@ -177,24 +176,32 @@ async fn chat_with_system(
     // Step 1: Find relevant files
     let relevant_files = search_index(index, user_query);
 
-    // Step 2: Prepare context for the LLM
-    let context = prepare_context(&relevant_files, user_query);
+    // Step 2: Extract file paths from relevant_files
+    let relevant_file_paths: Vec<String> =
+        relevant_files.into_iter().map(|(file, _)| file).collect();
 
-    // Step 3: Generate response using the LLM
+    // Step 3: Prepare context for the LLM
+    let context = prepare_context(&relevant_file_paths, user_query)?;
+
+    // Step 4: Generate response using the LLM
     let response = generate_llm_response(&context, api_key).await?;
 
     Ok(response)
 }
 
-fn prepare_context(relevant_files: &[(String, String)], user_query: &str) -> String {
-    let mut context = format!(
-        "User query: {}\n\nRelevant files and summaries:\n",
-        user_query
-    );
-    for (file, summary) in relevant_files {
-        context.push_str(&format!("File: {}\nSummary: {}\n\n", file, summary));
+fn prepare_context(
+    relevant_files: &[String],
+    user_query: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut context = format!("User query: {}\n\nRelevant file contents:\n", user_query);
+    for file_path in relevant_files {
+        let file_content = read_file_contents(file_path)?;
+        context.push_str(&format!(
+            "File: {}\nContent:\n{}\n\n",
+            file_path, file_content
+        ));
     }
-    context
+    Ok(context)
 }
 
 async fn generate_llm_response(
