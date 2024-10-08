@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use walkdir::WalkDir;
 
+use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,6 +15,8 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
 use std::env;
+use std::fs::File;
+use std::io::prelude::*;
 use std::io::{self, Write};
 use std::time::Instant;
 use syntect::easy::HighlightLines;
@@ -217,10 +220,14 @@ fn detect_language(file_path: &str) -> String {
     .to_string()
 }
 
-fn search_index(index: &HashMap<String, (String, String)>, query: &str) -> Vec<(String, f32)> {
+async fn search_index(
+    index: &HashMap<String, (String, String)>,
+    query: &str,
+    api_key: &str,
+) -> Vec<(String, f32)> {
     let mut relevant_files = Vec::new();
     for (file, (summary, language)) in index {
-        let relevance = calculate_relevance(summary, query, language);
+        let relevance = calculate_relevance(summary, query, language, api_key).await;
         if relevance > 0.0 {
             relevant_files.push((file.clone(), relevance));
         }
@@ -230,7 +237,7 @@ fn search_index(index: &HashMap<String, (String, String)>, query: &str) -> Vec<(
     relevant_files
 }
 
-fn calculate_relevance(summary: &str, query: &str, language: &str) -> f32 {
+async fn calculate_relevance(summary: &str, query: &str, language: &str, api_key: &str) -> f32 {
     let summary_words: Vec<&str> = summary.split_whitespace().collect();
     let query_words: Vec<&str> = query.split_whitespace().collect();
 
@@ -252,16 +259,64 @@ fn calculate_relevance(summary: &str, query: &str, language: &str) -> f32 {
         _ => vec![],
     };
 
-    let mut relevance = 0.0;
+    let mut keyword_relevance = 0.0;
     for query_word in &query_words {
         if summary_words.contains(query_word) {
-            relevance += 1.0;
+            keyword_relevance += 1.0;
         }
         if language_keywords.contains(query_word) {
-            relevance += 0.5;
+            keyword_relevance += 0.5;
         }
     }
-    relevance / query_words.len() as f32
+    keyword_relevance /= query_words.len() as f32;
+
+    let llm_relevance = get_llm_relevance_score(summary, query, api_key)
+        .await
+        .unwrap_or(0.0);
+
+    // Combine keyword-based relevance and LLM-based relevance
+    // You can adjust these weights based on your requirements
+    const KEYWORD_WEIGHT: f32 = 0.3;
+    const LLM_WEIGHT: f32 = 0.7;
+
+    (keyword_relevance * KEYWORD_WEIGHT) + (llm_relevance * LLM_WEIGHT)
+}
+
+async fn get_llm_relevance_score(
+    summary: &str,
+    query: &str,
+    api_key: &str,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let prompt = format!(
+        "On a scale of 0 to 1, how relevant is the following summary to the given query? Provide only a number as the answer.\n\nSummary: {}\n\nQuery: {}",
+        summary, query
+    );
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-sonnet-20240229",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 100
+        }))
+        .send()
+        .await?;
+
+    let body: Value = response.json().await?;
+    let score_str = body["content"][0]["text"]
+        .as_str()
+        .ok_or("Missing 'text' field in API response")?
+        .trim();
+
+    score_str.parse::<f32>().map_err(|e| e.into())
 }
 
 async fn chat_with_system(
@@ -273,7 +328,7 @@ async fn chat_with_system(
     debug_print!("Starting chat with system");
 
     // Step 1: Find relevant files
-    let relevant_files = search_index(index, user_query);
+    let relevant_files = search_index(index, user_query, api_key).await;
 
     // Step 2: Extract file paths and languages from relevant_files
     let relevant_file_info: Vec<(String, String)> = relevant_files
@@ -568,6 +623,36 @@ async fn chat_mode(
                 + &LIGHT_UP_AND_LEFT.to_string()
         );
         println!();
+
+        // Prompt for copying output or saving to file
+        loop {
+            let action = rl.readline(&format!(
+                "{} ",
+                "Do you want to (c)opy to clipboard, (s)ave to file, or (n)either? [c/s/n]"
+                    .bold()
+                    .yellow()
+            ))?;
+            match action.trim().to_lowercase().as_str() {
+                "c" => {
+                    if let Err(e) = copy_to_clipboard(&response) {
+                        eprintln!("Failed to copy to clipboard: {}", e);
+                    }
+                    break;
+                }
+                "s" => {
+                    let filename = format!(
+                        "ai_response_{}.txt",
+                        chrono::Local::now().format("%Y%m%d_%H%M%S")
+                    );
+                    if let Err(e) = save_to_file(&response, &filename) {
+                        eprintln!("Failed to save to file: {}", e);
+                    }
+                    break;
+                }
+                "n" => break,
+                _ => println!("Invalid option. Please choose 'c', 's', or 'n'."),
+            }
+        }
     }
     Ok(())
 }
@@ -702,6 +787,20 @@ fn load_conversation() -> std::io::Result<Vec<Value>> {
     let conversation_history: Vec<Value> = serde_json::from_str(&json)?;
     println!("Conversation loaded successfully.");
     Ok(conversation_history)
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx: ClipboardContext = ClipboardProvider::new()?;
+    ctx.set_contents(text.to_owned())?;
+    println!("Output copied to clipboard.");
+    Ok(())
+}
+
+fn save_to_file(text: &str, filename: &str) -> std::io::Result<()> {
+    let mut file = File::create(filename)?;
+    file.write_all(text.as_bytes())?;
+    println!("Output saved to file: {}", filename);
+    Ok(())
 }
 
 fn print_header(title: &str) {
