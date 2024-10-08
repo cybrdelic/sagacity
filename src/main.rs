@@ -177,17 +177,30 @@ async fn index_codebase(
     Ok(index)
 }
 
-fn search_index(index: &HashMap<String, String>, query: &str) -> Vec<(String, String)> {
-    let query_lower = query.to_lowercase();
-    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-    index
-        .iter()
-        .filter(|(_, summary)| {
-            let summary_lower = summary.to_lowercase();
-            query_words.iter().any(|&word| summary_lower.contains(word))
-        })
-        .map(|(file, summary)| (file.clone(), summary.clone()))
-        .collect()
+fn search_index(index: &HashMap<String, String>, query: &str) -> Vec<(String, f32)> {
+    let mut relevant_files = Vec::new();
+    for (file, summary) in index {
+        let relevance = calculate_relevance(summary, query);
+        if relevance > 0.0 {
+            relevant_files.push((file.clone(), relevance));
+        }
+    }
+    relevant_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    relevant_files.truncate(5); // Limit to top 5 most relevant files
+    relevant_files
+}
+
+fn calculate_relevance(summary: &str, query: &str) -> f32 {
+    let summary_words: Vec<&str> = summary.split_whitespace().collect();
+    let query_words: Vec<&str> = query.split_whitespace().collect();
+
+    let mut relevance = 0.0;
+    for query_word in &query_words {
+        if summary_words.contains(query_word) {
+            relevance += 1.0;
+        }
+    }
+    relevance / query_words.len() as f32
 }
 
 async fn chat_with_system(
@@ -368,7 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
 
     loop {
-        let choices = vec!["Search", "Chat", "Print Index", "Quit"];
+        let choices = vec!["Chat", "Print Index", "Quit"];
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Choose an action")
             .default(0)
@@ -376,10 +389,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .interact()?;
 
         match selection {
-            0 => search_mode(&index, &mut rl)?,
-            1 => chat_mode(&index, &api_key, &mut rl).await?,
-            2 => print_index(&index),
-            3 => {
+            0 => chat_mode(&index, &api_key, &mut rl).await?,
+            1 => print_index(&index),
+            2 => {
                 println!("{}", "Exiting application. Goodbye!".bold().green());
                 break;
             }
@@ -387,44 +399,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(())
-}
-
-fn search_mode(
-    index: &HashMap<String, String>,
-    rl: &mut Editor<MyHelper, DefaultHistory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let query = rl.readline("Enter your search query (or 'back' to return to main menu): ")?;
-        let query = query.trim();
-
-        if query.to_lowercase() == "back" {
-            break;
-        }
-
-        let results: Vec<(String, String)> = search_index(index, query);
-        if results.is_empty() {
-            println!("{}", "No results found for your query.".yellow());
-        } else {
-            println!("{}", format!("Found {} results:", results.len()).green());
-            for (i, (file, summary)) in results.iter().enumerate() {
-                println!("{}. {}", (i + 1).to_string().cyan(), file.bold());
-                println!("   {}", summary);
-            }
-
-            println!(
-                "\nEnter the number of a file to view its contents, or press Enter to continue:"
-            );
-            let choice = rl.readline("> ")?.trim().to_string();
-            if let Ok(index) = choice.parse::<usize>() {
-                if index > 0 && index <= results.len() {
-                    if let Some((file, _)) = results.get(index - 1) {
-                        view_file_contents(file)?;
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
