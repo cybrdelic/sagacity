@@ -1,7 +1,9 @@
 use reqwest;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use clipboard::{ClipboardContext, ClipboardProvider};
@@ -164,6 +166,34 @@ async fn summarize_with_claude(
     Ok(summary)
 }
 
+#[derive(Serialize, Deserialize)]
+struct IndexCache {
+    timestamp: u64,
+    index: HashMap<String, (String, String)>,
+}
+
+fn save_index_cache(
+    index: &HashMap<String, (String, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cache = IndexCache {
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        index: index.clone(),
+    };
+    let serialized = serde_json::to_string(&cache)?;
+    fs::write("index_cache.json", serialized)?;
+    Ok(())
+}
+
+fn load_index_cache(
+) -> Result<Option<(u64, HashMap<String, (String, String)>)>, Box<dyn std::error::Error>> {
+    if let Ok(contents) = fs::read_to_string("index_cache.json") {
+        let cache: IndexCache = serde_json::from_str(&contents)?;
+        Ok(Some((cache.timestamp, cache.index)))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn index_codebase(
     root_dir: &str,
     api_key: &str,
@@ -202,6 +232,10 @@ async fn index_codebase(
         "Indexing complete. Total files indexed: {}",
         index.len()
     ));
+
+    // Save the index cache
+    save_index_cache(&index)?;
+
     Ok(index)
 }
 
@@ -478,12 +512,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .template("{spinner:.green} {msg}")
             .unwrap(),
     );
-    pb.set_message("Indexing codebase...");
 
-    let start = Instant::now();
-    let index = index_codebase(root_dir, &api_key, &pb).await?;
-    let duration = start.elapsed();
-    pb.finish_with_message(format!("Indexing completed in {:?}", duration));
+    let index = if let Some((cache_timestamp, cached_index)) = load_index_cache()? {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        if current_time - cache_timestamp < 3600 {
+            // Cache is valid for 1 hour
+            println!("{}", "Using cached index".green());
+            cached_index
+        } else {
+            pb.set_message("Cached index outdated. Reindexing codebase...");
+            index_codebase(root_dir, &api_key, &pb).await?
+        }
+    } else {
+        pb.set_message("Indexing codebase...");
+        index_codebase(root_dir, &api_key, &pb).await?
+    };
+
+    pb.finish_with_message("Indexing completed");
 
     println!(
         "{}",
