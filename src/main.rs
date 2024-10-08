@@ -412,6 +412,10 @@ impl Chatbot {
         }
     }
 
+    fn get_last_user_message(&self) -> Option<&Message> {
+        self.memory.iter().rev().find(|m| m.role == "user")
+    }
+
     async fn chat(&mut self, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
         debug_print!("Starting chat with system");
 
@@ -431,18 +435,8 @@ impl Chatbot {
         let context = prepare_context(&relevant_file_info, user_query)?;
 
         // Step 4: Generate response using the LLM
-        let memory_json: Vec<Value> = self
-            .memory
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.role,
-                    "content": m.content
-                })
-            })
-            .collect();
         let (response, _) =
-            generate_llm_response(&context, &self.api_key, &memory_json, user_query).await?;
+            generate_llm_response(&context, &self.api_key, &self.memory, user_query).await?;
 
         // Step 5: Update conversation history
         self.memory.push(Message {
@@ -457,10 +451,6 @@ impl Chatbot {
         });
 
         Ok(response)
-    }
-
-    fn get_last_user_message(&self) -> Option<&Message> {
-        self.memory.iter().rev().find(|m| m.role == "user")
     }
 }
 
@@ -489,16 +479,26 @@ fn prepare_context(
 async fn generate_llm_response(
     context: &str,
     api_key: &str,
-    conversation_history: &Vec<Value>,
+    conversation_history: &Vec<Message>,
     user_query: &str,
 ) -> Result<(String, bool), Box<dyn std::error::Error>> {
     debug_print!("Generating LLM response");
     let client = reqwest::Client::new();
 
-    let mut messages = conversation_history.clone();
+    let mut messages: Vec<Value> = conversation_history
+        .iter()
+        .map(|m| {
+            json!({
+                "role": m.role,
+                "content": m.content
+            })
+        })
+        .collect();
+
+    // Add the current context and user query
     messages.push(json!({
         "role": "user",
-        "content": format!("Based on the following context about a codebase, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
+        "content": format!("Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
     }));
 
     let response = client
@@ -509,7 +509,8 @@ async fn generate_llm_response(
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": messages,
-            "max_tokens":4000
+            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions.",
+            "max_tokens": 4000
         }))
         .send()
         .await
@@ -926,6 +927,7 @@ fn display_help() {
         "/load:".bold(),
         "Load a previously saved conversation"
     );
+    println!("  {} {}", "/last:".bold(), "Display your last message");
     println!("\n{}", "Chat Instructions:".bold().yellow());
     println!("  Type your questions normally to chat with the AI about the codebase.");
     println!("  The AI will provide information based on the indexed files and your queries.");
@@ -936,6 +938,7 @@ fn display_help() {
     println!("  - Be specific in your questions to get more accurate responses.");
     println!("  - Use '/save' regularly to keep a backup of your conversation.");
     println!("  - If you're lost, use '/clear' to start a fresh conversation.");
+    println!("  - Use '/last' to review your most recent message.");
     println!();
 }
 
