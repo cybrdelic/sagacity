@@ -2,6 +2,7 @@ use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 use diffy::{apply, Patch};
+use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest;
@@ -76,10 +77,17 @@ fn get_claude_api_key() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn scan_codebase(root_dir: &str) -> Vec<String> {
-    WalkDir::new(root_dir)
-        .into_iter()
+    let walker = WalkBuilder::new(root_dir)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .build();
+
+    walker
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .filter(|entry| {
             let extension = entry.path().extension().and_then(|e| e.to_str());
             matches!(
