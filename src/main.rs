@@ -1,43 +1,29 @@
-use reqwest;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::WalkDir;
-
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
+use diffy::{apply, Patch};
 use indicatif::{ProgressBar, ProgressStyle};
+use regex::Regex;
+use reqwest;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::fs::File;
-use std::io::{self, Write};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
-use termimad::crossterm::{
-    cursor::MoveTo,
-    execute,
-    terminal::{Clear, ClearType},
-};
-use termimad::MadSkin;
-// Unicode box-drawing characters
-const LIGHT_DOWN_AND_RIGHT: char = '┌';
-const LIGHT_DOWN_AND_LEFT: char = '┐';
-const LIGHT_UP_AND_RIGHT: char = '└';
-const LIGHT_UP_AND_LEFT: char = '┘';
-const LIGHT_VERTICAL_AND_RIGHT: char = '├';
-const LIGHT_VERTICAL_AND_LEFT: char = '┤';
-const LIGHT_HORIZONTAL: char = '─';
-const LIGHT_VERTICAL: char = '│';
+use std::io::Write;
+use std::path::Path;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
+use textwrap;
+use walkdir::WalkDir;
 
 const HEAVY_DOWN_AND_RIGHT: char = '┏';
 const HEAVY_DOWN_AND_LEFT: char = '┓';
@@ -45,6 +31,15 @@ const HEAVY_UP_AND_RIGHT: char = '┗';
 const HEAVY_UP_AND_LEFT: char = '┛';
 const HEAVY_HORIZONTAL: char = '━';
 const HEAVY_VERTICAL: char = '┃';
+
+const LIGHT_DOWN_AND_RIGHT: char = '┌';
+const LIGHT_DOWN_AND_LEFT: char = '┐';
+const LIGHT_UP_AND_RIGHT: char = '└';
+const LIGHT_UP_AND_LEFT: char = '┘';
+const LIGHT_HORIZONTAL: char = '─';
+const LIGHT_VERTICAL: char = '│';
+const LIGHT_VERTICAL_AND_RIGHT: char = '├';
+const LIGHT_VERTICAL_AND_LEFT: char = '┤';
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01"; // Add this line
@@ -350,6 +345,51 @@ async fn calculate_relevance(summary: &str, query: &str, language: &str, api_key
     (keyword_relevance * KEYWORD_WEIGHT) + (llm_relevance * LLM_WEIGHT)
 }
 
+async fn check_intent_to_change(
+    query: &str,
+    api_key: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let prompt = format!(
+        "Does the following query indicate an intent to change or modify code? Answer with 'yes' or 'no'.\n\nQuery: {}",
+        query
+    );
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-sonnet-20240229",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 100
+        }))
+        .send()
+        .await?;
+
+    let body: Value = response.json().await?;
+    let answer = body["content"][0]["text"]
+        .as_str()
+        .ok_or("Missing 'text' field in API response")?
+        .trim()
+        .to_lowercase();
+
+    Ok(answer == "yes")
+}
+
+fn apply_diff(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let original_content = fs::read_to_string(file_path)?;
+    let patch = Patch::from_str(diff)?;
+    let new_content = apply(&original_content, &patch)?;
+    fs::write(file_path, new_content)?;
+    Ok(())
+}
+
 async fn get_llm_relevance_score(
     summary: &str,
     query: &str,
@@ -397,10 +437,18 @@ struct Message {
     timestamp: DateTime<Utc>,
 }
 
+struct ConversationSession {
+    name: String,
+    index: HashMap<String, (String, String)>,
+    memory: Vec<Message>,
+}
+
 struct Chatbot {
     index: HashMap<String, (String, String)>,
     api_key: String,
     memory: Vec<Message>,
+    sessions: Vec<ConversationSession>,
+    current_session: Option<usize>,
 }
 
 impl Chatbot {
@@ -409,7 +457,36 @@ impl Chatbot {
             index,
             api_key,
             memory: Vec::new(),
+            sessions: Vec::new(),
+            current_session: None,
         }
+    }
+
+    fn create_session(&mut self, name: String, index: HashMap<String, (String, String)>) {
+        let session = ConversationSession {
+            name,
+            index,
+            memory: Vec::new(),
+        };
+        self.sessions.push(session);
+        self.current_session = Some(self.sessions.len() - 1);
+    }
+
+    fn switch_session(&mut self, index: usize) {
+        if index < self.sessions.len() {
+            self.current_session = Some(index);
+            self.index = self.sessions[index].index.clone();
+            self.memory = self.sessions[index].memory.clone();
+        }
+    }
+
+    fn get_current_session(&self) -> Option<&ConversationSession> {
+        self.current_session.map(|index| &self.sessions[index])
+    }
+
+    fn get_current_session_mut(&mut self) -> Option<&mut ConversationSession> {
+        self.current_session
+            .map(move |index| &mut self.sessions[index])
     }
 
     fn get_last_user_message(&self) -> Option<&Message> {
@@ -509,7 +586,7 @@ async fn generate_llm_response(
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": messages,
-            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions.",
+            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. In all your responses, keep a cool and chill vibe that is cracked and overpowered in terms of technical ability and aptitude. You are personable but not in a creepy fake way.",
             "max_tokens": 4000
         }))
         .send()
@@ -621,106 +698,364 @@ impl Helper for MyHelper {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    print_header("Welcome to the Enhanced Codebase Explorer");
+    clear_screen();
+    display_welcome_screen();
+
     let root_dir = "."; // Current directory
-    println!("{}", "Root directory:".bold());
-    println!("  {}", root_dir.cyan());
-
     let api_key = get_claude_api_key()?;
-    println!("{}", "API key retrieved successfully".green());
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-
-    let (index, _last_modification) = if let Some((cache_timestamp, last_mod, cached_index)) =
-        load_index_cache()?
-    {
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if current_time - cache_timestamp < 3600 && !check_for_codebase_changes(root_dir, last_mod)?
-        {
-            println!("{}", "Using cached index".green());
-            (cached_index, last_mod)
-        } else {
-            pb.set_message("Changes detected or cache outdated. Reindexing codebase...");
-            index_codebase(root_dir, &api_key, &pb).await?
-        }
-    } else {
-        pb.set_message("Indexing codebase...");
-        index_codebase(root_dir, &api_key, &pb).await?
-    };
-
-    pb.finish_with_message("Indexing completed");
-
-    println!(
-        "{}",
-        "Codebase indexed successfully. You can now explore the codebase."
-            .bold()
-            .green()
-    );
-    println!(
-        "Number of indexed files: {}",
-        index.len().to_string().yellow()
-    );
+    let index = initialize_codebase_index(root_dir, &api_key).await?;
 
     let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
     rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
 
-    loop {
-        let choices = vec!["Chat", "Print Index", "Quit"];
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Choose an action")
-            .default(0)
-            .items(&choices)
-            .interact()?;
+    let mut chatbot = Chatbot::new(index.clone(), api_key.to_string());
+    chatbot.create_session("Default".to_string(), index);
 
-        match selection {
-            0 => chat_mode(&index, &api_key, &mut rl).await?,
-            1 => print_index(&index),
-            2 => {
-                println!("{}", "Exiting application. Goodbye!".bold().green());
+    loop {
+        clear_screen();
+        match display_main_menu() {
+            MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
+            MainMenuOption::CodeEdit => code_edit_mode(&mut chatbot, &mut rl).await?,
+            MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
+            MainMenuOption::ManageSessions => manage_sessions(&mut chatbot, &mut rl).await?,
+            MainMenuOption::Help => display_help(),
+            MainMenuOption::Quit => {
+                display_goodbye_message();
                 break;
             }
-            _ => unreachable!(),
         }
+        pause();
     }
 
     Ok(())
 }
 
-async fn chat_mode(
-    index: &HashMap<String, (String, String)>,
+fn clear_screen() {
+    print!("\x1B[2J\x1B[1;1H");
+}
+
+fn display_welcome_screen() {
+    println!("{}", "Welcome to Codebase Explorer".bold().cyan());
+    println!("{}", "Your intelligent coding companion".italic());
+    println!("\nInitializing...");
+}
+
+async fn initialize_codebase_index(
+    root_dir: &str,
     api_key: &str,
+) -> Result<HashMap<String, (String, String)>, Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Indexing codebase...");
+
+    let (index, _) = if let Some((cache_timestamp, last_mod, cached_index)) = load_index_cache()? {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        if current_time - cache_timestamp < 3600 && !check_for_codebase_changes(root_dir, last_mod)?
+        {
+            (cached_index, last_mod)
+        } else {
+            index_codebase(root_dir, api_key, &pb).await?
+        }
+    } else {
+        index_codebase(root_dir, api_key, &pb).await?
+    };
+
+    pb.finish_with_message("Indexing completed");
+    Ok(index)
+}
+
+enum MainMenuOption {
+    Chat,
+    CodeEdit,
+    BrowseIndex,
+    ManageSessions,
+    Help,
+    Quit,
+}
+
+fn display_main_menu() -> MainMenuOption {
+    let choices = vec![
+        "Chat with AI",
+        "Code Edit Mode",
+        "Browse Index",
+        "Manage Sessions",
+        "Help",
+        "Quit",
+    ];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What would you like to do?")
+        .default(0)
+        .items(&choices)
+        .interact()
+        .unwrap();
+
+    match selection {
+        0 => MainMenuOption::Chat,
+        1 => MainMenuOption::CodeEdit,
+        2 => MainMenuOption::BrowseIndex,
+        3 => MainMenuOption::ManageSessions,
+        4 => MainMenuOption::Help,
+        5 => MainMenuOption::Quit,
+        _ => unreachable!(),
+    }
+}
+
+fn pause() {
+    println!("\nPress Enter to continue...");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+}
+
+fn display_goodbye_message() {
+    clear_screen();
+    println!("{}", "Thank you for using Codebase Explorer".bold().green());
+    println!("Have a great day!");
+}
+
+async fn manage_sessions(
+    chatbot: &mut Chatbot,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut chatbot = Chatbot::new(index.clone(), api_key.to_string());
-
     loop {
-        print_header("Chat Mode");
-        let chat_query = rl.readline(&format!(
-            "{} ",
-            "Enter your question (or type '/exit' to end chat, '/help' for commands):"
+        clear_screen();
+        print_header("Manage Sessions");
+
+        let mut choices = vec!["Create new session", "Return to main menu"];
+        for session in &chatbot.sessions {
+            choices.push(&session.name);
+        }
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select a session or action")
+            .default(0)
+            .items(&choices)
+            .interact()?;
+
+        if selection == 0 {
+            create_new_session(chatbot, rl).await?;
+        } else if selection == 1 {
+            break;
+        } else {
+            chatbot.switch_session(selection - 2);
+            println!(
+                "{}",
+                format!(
+                    "Switched to session: {}",
+                    chatbot.get_current_session().unwrap().name
+                )
+                .green()
+            );
+            pause();
+        }
+    }
+    Ok(())
+}
+
+async fn create_new_session(
+    chatbot: &mut Chatbot,
+    rl: &mut Editor<MyHelper, DefaultHistory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = rl.readline("Enter a name for the new session: ")?;
+    let root_dir = rl.readline("Enter the root directory for the new session: ")?;
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Indexing codebase for new session...");
+
+    let (new_index, _) = index_codebase(&root_dir, &chatbot.api_key, &pb).await?;
+    chatbot.create_session(name.trim().to_string(), new_index);
+
+    println!("{}", "New session created and switched to.".green());
+    pause();
+    Ok(())
+}
+
+fn detect_file_change_request(query: &str) -> bool {
+    let patterns = [
+        r"(?i)change|modify|update|edit|alter",
+        r"(?i)file|code|implementation|function",
+    ];
+    patterns
+        .iter()
+        .all(|pattern| Regex::new(pattern).unwrap().is_match(query))
+}
+
+fn generate_diff(original: &str, modified: &str) -> String {
+    use diffy::create_patch;
+    use diffy::PatchFormatter;
+
+    let patch = create_patch(original, modified);
+    let patch_str = format!("{}", PatchFormatter::new().fmt_patch(&patch));
+    patch_str
+}
+
+fn display_colorized_diff(diff: &str) {
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++ ") {
+            println!("{}", line.green().bold());
+        } else if line.starts_with('-') && !line.starts_with("--- ") {
+            println!("{}", line.red().bold());
+        } else if line.starts_with("@@") {
+            println!("{}", line.yellow().bold());
+        } else {
+            println!("{}", line.normal());
+        }
+    }
+}
+
+fn apply_changes(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        format!("Applying changes to {}...", file_path)
+            .bold()
+            .green()
+    );
+    let original_content = fs::read_to_string(file_path)?;
+    let patch = Patch::from_str(diff)?;
+    let new_content = diffy::apply(&original_content, &patch)?;
+    fs::write(file_path, new_content)?;
+    println!("{}", "Changes applied successfully.".bold().green());
+    Ok(())
+}
+fn open_in_diff_application(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        "Opening diff in external application...".bold().yellow()
+    );
+    open_diff_in_external_app(diff)?;
+
+    let apply = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Do you want to apply the changes?")
+        .default(0)
+        .items(&["Yes", "No"])
+        .interact()?;
+
+    if apply == 0 {
+        apply_changes(file_path, diff)?;
+    } else {
+        println!(
+            "{}",
+            format!("Changes discarded for {}", file_path)
                 .bold()
                 .yellow()
+        );
+    }
+
+    Ok(())
+}
+
+fn view_full_diff(diff: &str) {
+    clear_screen();
+    print_header("Full Diff View");
+    display_colorized_diff(diff);
+    pause();
+}
+
+fn open_diff_in_external_app(diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut temp_file = NamedTempFile::new()?;
+    write!(temp_file, "{}", diff)?;
+
+    #[cfg(target_os = "macos")]
+    let diff_command = "opendiff";
+    #[cfg(target_os = "linux")]
+    let diff_command = "meld";
+    #[cfg(target_os = "windows")]
+    let diff_command = "winmerge";
+
+    Command::new(diff_command).arg(temp_file.path()).status()?;
+
+    Ok(())
+}
+async fn code_edit_mode(
+    chatbot: &mut Chatbot,
+    rl: &mut Editor<MyHelper, DefaultHistory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        clear_screen();
+        print_header("Code Edit Mode");
+        let file_path =
+            rl.readline("Enter the file path you want to edit (or type '/exit' to return): ")?;
+        if file_path.trim() == "/exit" {
+            break;
+        }
+
+        if !Path::new(&file_path).exists() {
+            println!("{}", "File does not exist.".red());
+            pause();
+            continue;
+        }
+
+        let original_content = fs::read_to_string(&file_path)?;
+        let editor = rl.readline("Enter your code editor command (e.g., 'nano', 'vim'): ")?;
+        Command::new(editor.trim())
+            .arg(&file_path)
+            .status()
+            .expect("Failed to open editor");
+
+        let modified_content = fs::read_to_string(&file_path)?;
+        if original_content != modified_content {
+            let diff = generate_diff(&original_content, &modified_content);
+            println!("Diff for {}:", file_path.bold());
+            display_colorized_diff(&diff);
+            println!(); // Add a newline for better readability
+
+            let confirm = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Do you want to keep the changes?")
+                .default(0)
+                .items(&["Yes", "No"])
+                .interact()?;
+
+            if confirm == 0 {
+                apply_changes(&file_path, &diff)?;
+            } else {
+                fs::write(&file_path, original_content)?;
+                println!("{}", "Changes discarded.".yellow());
+            }
+            pause();
+        } else {
+            println!("{}", "No changes detected.".yellow());
+            pause();
+        }
+    }
+    Ok(())
+}
+
+async fn chat_mode(
+    chatbot: &mut Chatbot,
+    rl: &mut Editor<MyHelper, DefaultHistory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        clear_screen();
+        print_header("Chat with AI");
+        display_chat_history(chatbot);
+
+        let chat_query = rl.readline(&format!(
+            "{} ",
+            "Enter your question (or type '/help' for commands):"
+                .bold()
+                .cyan()
         ))?;
         let chat_query = chat_query.trim();
 
         match chat_query {
-            "/exit" => {
-                println!("{}", "Ending chat session.".bold().green());
-                break;
-            }
+            "/exit" => break,
             "/clear" => {
                 chatbot.memory.clear();
                 println!("{}", "Conversation history cleared.".bold().green());
                 continue;
             }
             "/help" => {
-                display_help();
+                display_chat_help();
+                pause();
                 continue;
             }
             "/save" => {
@@ -731,183 +1066,212 @@ async fn chat_mode(
                 chatbot.memory = load_conversation()?;
                 continue;
             }
-            "/last" => {
-                if let Some(last_message) = chatbot.get_last_user_message() {
-                    println!("Your last message was: {}", last_message.content.cyan());
-                } else {
-                    println!("No previous messages found.");
-                }
-                continue;
-            }
             _ => {}
         }
 
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
+                .template("{spinner:.cyan} {msg}")
                 .unwrap(),
         );
-        pb.set_message("AI is thinking...");
+        pb.set_message("AI is analyzing your request...");
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        let response = chat_with_system(&mut chatbot, chat_query).await?;
-
+        let response = chat_with_system(chatbot, chat_query).await?;
         pb.finish_and_clear();
 
-        println!(
-            "{}",
-            LIGHT_DOWN_AND_RIGHT.to_string()
-                + &LIGHT_HORIZONTAL.to_string().repeat(58)
-                + &LIGHT_DOWN_AND_LEFT.to_string()
-        );
-        println!(
-            "{} {: <56} {}",
-            LIGHT_VERTICAL,
-            "You:".bold().blue(),
-            LIGHT_VERTICAL
-        );
-        for line in textwrap::wrap(chat_query, 56) {
-            println!("{} {: <56} {}", LIGHT_VERTICAL, line, LIGHT_VERTICAL);
-        }
-        println!(
-            "{}",
-            LIGHT_VERTICAL_AND_RIGHT.to_string()
-                + &LIGHT_HORIZONTAL.to_string().repeat(58)
-                + &LIGHT_VERTICAL_AND_LEFT.to_string()
-        );
-        println!(
-            "{} {: <56} {}",
-            LIGHT_VERTICAL,
-            "AI:".bold().green(),
-            LIGHT_VERTICAL
-        );
-        for line in textwrap::wrap(&response, 56) {
-            println!("{} {: <56} {}", LIGHT_VERTICAL, line, LIGHT_VERTICAL);
-        }
-        println!(
-            "{}",
-            LIGHT_UP_AND_RIGHT.to_string()
-                + &LIGHT_HORIZONTAL.to_string().repeat(58)
-                + &LIGHT_UP_AND_LEFT.to_string()
-        );
-        println!();
+        chatbot.memory.push(Message {
+            role: "user".to_string(),
+            content: chat_query.to_string(),
+            timestamp: Utc::now(),
+        });
+        chatbot.memory.push(Message {
+            role: "assistant".to_string(),
+            content: response.clone(),
+            timestamp: Utc::now(),
+        });
 
-        // Prompt for copying output or saving to file
-        loop {
-            let action = rl.readline(&format!(
-                "{} ",
-                "Do you want to (c)opy to clipboard, (s)ave to file, or (n)either? [c/s/n]"
+        display_ai_response(&response);
+
+        // Extract file paths and changes from the AI response
+        let changes = extract_changes_from_response(&response);
+
+        if !changes.is_empty() {
+            println!(
+                "{}",
+                "The AI has proposed changes to the project files."
                     .bold()
                     .yellow()
-            ))?;
-            match action.trim().to_lowercase().as_str() {
-                "c" => {
-                    if let Err(e) = copy_to_clipboard(&response) {
-                        eprintln!("Failed to copy to clipboard: {}", e);
+            );
+
+            for (file_path, original, modified) in changes {
+                println!(
+                    "{}",
+                    format!("Proposed changes for file: {}", file_path)
+                        .bold()
+                        .cyan()
+                );
+                let diff = generate_diff(&original, &modified);
+                println!("Diff for {}:", file_path.bold());
+                display_colorized_diff(&diff);
+                println!(); // Add a newline for better readability
+
+                let confirm = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("What would you like to do with these changes?")
+                    .default(0)
+                    .items(&[
+                        "Apply changes",
+                        "Discard changes",
+                        "Open in diff application",
+                        "View full diff",
+                    ])
+                    .interact()?;
+
+                match confirm {
+                    0 => {
+                        apply_changes(&file_path, &diff)?;
                     }
-                    break;
-                }
-                "s" => {
-                    if let Err(e) = save_to_file(&response, api_key).await {
-                        eprintln!("Failed to save to file: {}", e);
+                    1 => {
+                        println!(
+                            "{}",
+                            format!("Changes discarded for {}", file_path)
+                                .bold()
+                                .yellow()
+                        );
                     }
-                    break;
+                    2 => {
+                        open_in_diff_application(&file_path, &diff)?;
+                        // After viewing in diff application, ask if user wants to apply changes
+                        let apply = Select::with_theme(&ColorfulTheme::default())
+                            .with_prompt("Do you want to apply the changes?")
+                            .default(0)
+                            .items(&["Yes", "No"])
+                            .interact()?;
+                        if apply == 0 {
+                            apply_changes(&file_path, &diff)?;
+                        } else {
+                            println!(
+                                "{}",
+                                format!("Changes discarded for {}", file_path)
+                                    .bold()
+                                    .yellow()
+                            );
+                        }
+                    }
+                    3 => {
+                        view_full_diff(&diff);
+                        // After viewing the full diff, ask again what to do
+                        continue;
+                    }
+                    _ => unreachable!(),
                 }
-                "n" => break,
-                _ => println!("Invalid option. Please choose 'c', 's', or 'n'."),
+            }
+        } else {
+            if let Err(e) = handle_response_actions(&response, &chatbot.api_key).await {
+                eprintln!("Error: {}", e);
             }
         }
     }
     Ok(())
 }
 
-use textwrap::wrap;
+fn extract_changes_from_response(response: &str) -> Vec<(String, String, String)> {
+    let mut changes = Vec::new();
+    let lines: Vec<&str> = response.lines().collect();
+    let mut i = 0;
 
-fn display_conversation(conversation_history: &[Value], _skin: &MadSkin) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, Clear(ClearType::All))?;
+    while i < lines.len() {
+        if lines[i].ends_with(".rs") || lines[i].ends_with(".toml") {
+            let file_path = lines[i].to_string();
+            i += 1;
+            let mut original = String::new();
+            let mut modified = String::new();
 
-    let terminal_width = termimad::crossterm::terminal::size()?.0 as usize;
-    let content_width = terminal_width.saturating_sub(4); // Account for minimal indentation
-
-    for message in conversation_history {
-        let role = message["role"].as_str().unwrap_or("unknown");
-        let content = message["content"].as_str().unwrap_or("");
-
-        let formatted_role = match role {
-            "user" => "You:".blue().bold(),
-            "assistant" => "AI:".green().bold(),
-            _ => "Unknown:".yellow().bold(),
-        };
-
-        println!("{}", formatted_role);
-
-        if role == "assistant" {
-            format_ai_response(content, content_width)?;
-        } else {
-            let wrapped_content = wrap(content, content_width);
-            for line in wrapped_content {
-                println!("  {}", line.trim());
+            while i < lines.len() && !lines[i].starts_with("<SEARCH>") {
+                i += 1;
             }
+            i += 1;
+
+            while i < lines.len() && !lines[i].starts_with("</SEARCH>") {
+                original.push_str(lines[i]);
+                original.push('\n');
+                i += 1;
+            }
+            i += 1;
+
+            while i < lines.len() && !lines[i].starts_with("<REPLACE>") {
+                i += 1;
+            }
+            i += 1;
+
+            while i < lines.len() && !lines[i].starts_with("</REPLACE>") {
+                modified.push_str(lines[i]);
+                modified.push('\n');
+                i += 1;
+            }
+
+            changes.push((file_path, original, modified));
         }
+        i += 1;
+    }
+
+    changes
+}
+
+fn display_chat_history(chatbot: &Chatbot) {
+    for message in chatbot.memory.iter().rev().take(5).rev() {
+        let role = if message.role == "user" { "You" } else { "AI" };
+        let color = if message.role == "user" {
+            "blue"
+        } else {
+            "green"
+        };
+        println!("{}: {}", role.bold().color(color), message.content);
         println!();
     }
-
-    stdout.flush()?;
-    Ok(())
 }
 
-fn format_ai_response(content: &str, width: usize) -> std::io::Result<()> {
-    let mut in_code_block = false;
-    let mut code_block_content = String::new();
-    let indent = "    ";
-
-    for line in content.lines() {
-        if line.trim().starts_with("```") {
-            if in_code_block {
-                // End of code block, print the collected content
-                println!("{}```", indent);
-                for code_line in code_block_content.lines() {
-                    println!("{}{}", indent, code_line.yellow());
-                }
-                println!("{}```", indent);
-                code_block_content.clear();
-            } else {
-                // Start of code block
-                println!("{}{}", indent, line.trim());
-            }
-            in_code_block = !in_code_block;
-        } else if in_code_block {
-            code_block_content.push_str(line);
-            code_block_content.push('\n');
-        } else {
-            let wrapped_lines = wrap(line.trim(), width.saturating_sub(indent.len()));
-            for wrapped in wrapped_lines {
-                println!("{}{}", indent, wrapped);
-            }
-        }
-    }
-
-    // Handle any remaining code block content
-    if !code_block_content.is_empty() {
-        for code_line in code_block_content.lines() {
-            println!("{}{}", indent, code_line.yellow());
-        }
-        println!("{}```", indent);
-    }
-
-    Ok(())
+fn display_chat_help() {
+    clear_screen();
+    print_header("Chat Commands");
+    println!("{:<15} {}", "/exit".bold(), "Return to main menu");
+    println!("{:<15} {}", "/clear".bold(), "Clear conversation history");
+    println!("{:<15} {}", "/help".bold(), "Display this help message");
+    println!("{:<15} {}", "/save".bold(), "Save the current conversation");
+    println!(
+        "{:<15} {}",
+        "/load".bold(),
+        "Load a previously saved conversation"
+    );
 }
 
-fn display_typing_indicator(skin: &MadSkin) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveTo(0, termimad::crossterm::terminal::size()?.1 - 1)
-    )?;
-    skin.print_text("*System is typing...*");
-    stdout.flush()?;
+fn display_ai_response(response: &str) {
+    println!("{}", "AI Response:".bold().green());
+    for line in textwrap::wrap(response, 80) {
+        println!("  {}", line);
+    }
+    println!();
+}
+
+async fn handle_response_actions(
+    response: &str,
+    api_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let action = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("What would you like to do with the response?")
+            .default(0)
+            .items(&["Copy to clipboard", "Save to file", "Continue"])
+            .interact()?;
+
+        match action {
+            0 => copy_to_clipboard(response)?,
+            1 => save_to_file(response, api_key).await?,
+            2 => break,
+            _ => unreachable!(),
+        }
+    }
     Ok(())
 }
 
@@ -996,34 +1360,36 @@ fn print_header(title: &str) {
     );
 }
 
-fn print_index(index: &HashMap<String, (String, String)>) {
-    print_header("Index Browsing Mode");
-    for (file, (summary, _)) in index {
-        println!("{}", file.bold().blue());
-        println!("{}", LIGHT_VERTICAL);
-        for line in textwrap::wrap(summary, 80) {
-            println!("{}  {}", LIGHT_VERTICAL, line);
+fn browse_index(index: &HashMap<String, (String, String)>) {
+    let mut files: Vec<&String> = index.keys().collect();
+    files.sort();
+
+    loop {
+        clear_screen();
+        print_header("Browse Index");
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select a file to view its summary (or 'Back' to return)")
+            .default(0)
+            .items(&files)
+            .item("Back")
+            .interact()
+            .unwrap();
+
+        if selection == files.len() {
+            break;
+        } else {
+            let file = &files[selection];
+            if let Some((summary, language)) = index.get(*file) {
+                clear_screen();
+                print_header(&format!("File Summary: {}", file));
+                println!("{}: {}", "Language".bold(), language);
+                println!("{}: {}", "Summary".bold(), summary);
+                pause();
+            } else {
+                println!("Error: File not found in index");
+                pause();
+            }
         }
-        println!("{}\n", LIGHT_VERTICAL);
     }
-}
-
-fn view_file_contents(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let content = read_file_contents(file_path)?;
-
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
-    let syntax = ss
-        .find_syntax_for_file(file_path)?
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
-
-    println!("{}", format!("Contents of {}:", file_path).bold().green());
-    for line in LinesWithEndings::from(&content) {
-        let ranges: Vec<(Style, &str)> = h.highlight_line(line, &ss)?;
-        let escaped = as_24_bit_terminal_escaped(&ranges[..], true);
-        print!("{}", escaped);
-    }
-    println!();
-    Ok(())
 }

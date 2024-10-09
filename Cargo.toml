@@ -2,6 +2,8 @@
 name = "sagacity"
 version = "0.1.0"
 edition = "2021"
+description = "A Rust-based project for conversing with your codebase and handling codebase contextualization"
+license = "MIT"
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json"] }
@@ -20,4 +22,9 @@ cursor = "2.3.0"
 textwrap = "0.16.1"
 clipboard = "0.5.0"
 chrono = { version = "0.4.38", features = ["serde"] }
-serde = "1.0.210"
+serde = "1.0.210" 
+tempfile = "3.13.0"
+regex = "1.11.0"
+diff = "0.1.13"
+patch = "0.7.0"
+diffy = "0.4.0"
