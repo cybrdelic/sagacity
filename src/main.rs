@@ -749,7 +749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match display_main_menu() {
             MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
             MainMenuOption::CodeModification => {
-                code_modification_mode(&mut chatbot, &mut rl).await?
+                immutable_code_refactoring(&mut chatbot, &mut rl).await?
             }
             MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
             MainMenuOption::ManageSessions => manage_sessions(&mut chatbot, &mut rl).await?,
@@ -1091,7 +1091,7 @@ async fn handle_code_change_request(
 
     let context = prepare_context(&relevant_file_info, user_query)?;
 
-    let system_prompt = "You are an AI assistant that assists with code modifications. When the user provides a request, you generate the necessary code changes in standard unified diff format, including proper file paths and hunk headers. Enclose the diff within triple backticks with 'diff' specified, like ```diff ... ```.";
+    let system_prompt = "You are an AI assistant that assists with code modifications. When the user provides a request, you generate the necessary code changes in standard unified diff format, including proper file paths and hunk headers. Do not include any comments or explanations within the code changes. Enclose the diff within triple backticks with 'diff' specified, like ```diff ... ```.";
 
     let (response, _) = generate_llm_response_for_code_change(
         &context,
@@ -1114,6 +1114,7 @@ fn extract_code_changes(response: &str) -> Vec<(String, String)> {
 
         // Reconstruct the diff
         let diff = code_block.to_string();
+        println!("Extracted diff:\n{}", diff); // Add this line
 
         // Extract file paths from the diff
         let mut lines = code_block.lines();
@@ -1126,6 +1127,8 @@ fn extract_code_changes(response: &str) -> Vec<(String, String)> {
 
             // For simplicity, we'll use the modified file path
             code_changes.push((modified_file_path.to_string(), diff));
+        } else {
+            println!("Warning: Diff does not contain valid file headers.");
         }
     }
 
@@ -1133,13 +1136,48 @@ fn extract_code_changes(response: &str) -> Vec<(String, String)> {
 }
 
 fn apply_diff_to_file(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let absolute_path = fs::canonicalize(file_path)?;
+    println!("Applying diff to file: {}", absolute_path.display());
+    println!("Diff content:\n{}", diff);
+    if !Path::new(file_path).exists() {
+        println!("Error: File does not exist: {}", file_path);
+        return Err(format!("File does not exist: {}", file_path).into());
+    }
+
     println!("Applying diff to file: {}", file_path);
     println!("Diff content:\n{}", diff);
 
     let original_content = fs::read_to_string(file_path)?;
+    println!("Original content length: {}", original_content.len());
+
     let patch = Patch::from_str(diff)?;
     let new_content = diffy::apply(&original_content, &patch)?;
-    fs::write(file_path, new_content)?;
+    println!("New content length: {}", new_content.len());
+
+    if let Err(e) = fs::write(file_path, &new_content) {
+        println!("Failed to write to file: {}: {}", file_path, e);
+        return Err(e.into());
+    } else {
+        println!("Changes applied to file: {}", file_path);
+    }
+
+    // Check if the new content is different from the original
+    if original_content == new_content {
+        println!("No changes were made to the file: {}", file_path);
+    } else {
+        // Pass a reference to avoid moving ownership
+        fs::write(file_path, &new_content)?;
+        println!("Changes applied to file: {}", file_path);
+    }
+
+    // Read the updated content from the file
+    let updated_content = fs::read_to_string(file_path)?;
+    println!("Updated content:\n{}", updated_content);
+
+    // If you need to write the content again, you can still use `new_content`
+    fs::write(file_path, &new_content)?;
+    println!("Successfully wrote changes to file: {}", file_path);
+
     Ok(())
 }
 
@@ -1177,6 +1215,7 @@ async fn process_code_changes(
 
         match confirm {
             0 => {
+                println!("Applying changes to file: {}", file_path); // Add this line
                 if let Err(e) = apply_diff_to_file(&file_path, &diff) {
                     println!("{}", format!("Failed to apply changes: {}", e).bold().red());
                     println!("Please check the diff format and try again.");
@@ -1204,13 +1243,13 @@ async fn process_code_changes(
     Ok(())
 }
 
-async fn code_modification_mode(
+async fn immutable_code_refactoring(
     chatbot: &mut Chatbot,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         clear_screen();
-        print_header("Code Modification Mode");
+        print_header("Immutable Code Refactoring");
         display_chat_history(chatbot);
 
         let user_input = rl.readline(&format!(
