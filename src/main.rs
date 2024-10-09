@@ -15,6 +15,7 @@ use rustyline::{Context, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -172,31 +173,29 @@ struct IndexCache {
     timestamp: u64,
     last_modification: u64,
     index: HashMap<String, (String, String)>,
+    file_mod_times: HashMap<String, u64>, // Add this line
 }
 
 fn save_index_cache(
     index: &HashMap<String, (String, String)>,
     last_modification: u64,
+    file_mod_times: &HashMap<String, u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cache = IndexCache {
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         last_modification,
         index: index.clone(),
+        file_mod_times: file_mod_times.clone(),
     };
     let serialized = serde_json::to_string(&cache)?;
     fs::write("index_cache.json", serialized)?;
     Ok(())
 }
 
-fn load_index_cache(
-) -> Result<Option<(u64, u64, HashMap<String, (String, String)>)>, Box<dyn std::error::Error>> {
+fn load_index_cache() -> Result<Option<IndexCache>, Box<dyn std::error::Error>> {
     if let Ok(contents) = fs::read_to_string("index_cache.json") {
         let cache: IndexCache = serde_json::from_str(&contents)?;
-        Ok(Some((
-            cache.timestamp,
-            cache.last_modification,
-            cache.index,
-        )))
+        Ok(Some(cache))
     } else {
         Ok(None)
     }
@@ -225,12 +224,23 @@ async fn index_codebase(
     root_dir: &str,
     api_key: &str,
     pb: &ProgressBar,
-) -> Result<(HashMap<String, (String, String)>, u64), Box<dyn std::error::Error>> {
-    let mut index = HashMap::new();
+    previous_index: Option<IndexCache>, // Accept previous index
+) -> Result<
+    (HashMap<String, (String, String)>, u64, HashMap<String, u64>),
+    Box<dyn std::error::Error>,
+> {
+    let mut index = previous_index
+        .as_ref()
+        .map_or(HashMap::new(), |cache| cache.index.clone());
+    let mut file_mod_times = previous_index
+        .as_ref()
+        .map_or(HashMap::new(), |cache| cache.file_mod_times.clone());
+
     let files = scan_codebase(root_dir);
     pb.set_length(files.len() as u64);
 
     let mut last_modification = 0;
+    let mut files_set = HashSet::new();
 
     for (i, file_path) in files.iter().enumerate() {
         pb.set_message(format!(
@@ -239,31 +249,45 @@ async fn index_codebase(
             files.len(),
             file_path
         ));
-        let content = read_file_contents(&file_path)
-            .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
 
-        // Update last_modification time
-        if let Ok(metadata) = std::fs::metadata(file_path) {
-            if let Ok(modified) = metadata.modified() {
-                let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
-                last_modification = std::cmp::max(last_modification, modified_secs);
-            }
-        }
+        // Get the last modification time of the file
+        let metadata = fs::metadata(&file_path)?;
+        let modified = metadata.modified()?;
+        let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
+        last_modification = std::cmp::max(last_modification, modified_secs);
 
-        let language = detect_language(&file_path);
-        let summary = match summarize_with_claude(&content, api_key, &language).await {
-            Ok(summary) => summary,
-            Err(_e) => {
-                format!(
-                    "Failed to summarize. File content preview: {}",
-                    &content[..std::cmp::min(content.len(), 100)]
-                )
-            }
+        files_set.insert(file_path.clone());
+
+        // Check if the file has been modified since last indexing
+        let needs_reindex = match file_mod_times.get(file_path) {
+            Some(&cached_mod_time) => modified_secs > cached_mod_time,
+            None => true, // New file
         };
 
-        index.insert(file_path.clone(), (summary, language));
+        if needs_reindex {
+            let content = read_file_contents(&file_path)
+                .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
+
+            let language = detect_language(&file_path);
+            let summary = match summarize_with_claude(&content, api_key, &language).await {
+                Ok(summary) => summary,
+                Err(_e) => {
+                    format!(
+                        "Failed to summarize. File content preview: {}",
+                        &content[..std::cmp::min(content.len(), 100)]
+                    )
+                }
+            };
+
+            index.insert(file_path.clone(), (summary, language));
+            file_mod_times.insert(file_path.clone(), modified_secs);
+        }
         pb.inc(1);
     }
+
+    // Remove entries for files that no longer exist
+    index.retain(|file_path, _| files_set.contains(file_path));
+    file_mod_times.retain(|file_path, _| files_set.contains(file_path));
 
     pb.finish_with_message(format!(
         "Indexing complete. Total files indexed: {}",
@@ -271,9 +295,9 @@ async fn index_codebase(
     ));
 
     // Save the index cache
-    save_index_cache(&index, last_modification)?;
+    save_index_cache(&index, last_modification, &file_mod_times)?;
 
-    Ok((index, last_modification))
+    Ok((index, last_modification, file_mod_times))
 }
 
 fn detect_language(file_path: &str) -> String {
@@ -763,17 +787,8 @@ async fn initialize_codebase_index(
     );
     pb.set_message("Indexing codebase...");
 
-    let (index, _) = if let Some((cache_timestamp, last_mod, cached_index)) = load_index_cache()? {
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if current_time - cache_timestamp < 3600 && !check_for_codebase_changes(root_dir, last_mod)?
-        {
-            (cached_index, last_mod)
-        } else {
-            index_codebase(root_dir, api_key, &pb).await?
-        }
-    } else {
-        index_codebase(root_dir, api_key, &pb).await?
-    };
+    let cache = load_index_cache()?;
+    let (index, _, _) = index_codebase(root_dir, api_key, &pb, cache).await?;
 
     pb.finish_with_message("Indexing completed");
     Ok(index)
@@ -881,7 +896,8 @@ async fn create_new_session(
     );
     pb.set_message("Indexing codebase for new session...");
 
-    let (new_index, _) = index_codebase(&root_dir, &chatbot.api_key, &pb).await?;
+    let cache = load_index_cache()?;
+    let (new_index, _, _) = index_codebase(&root_dir, &chatbot.api_key, &pb, cache).await?;
     chatbot.create_session(name.trim().to_string(), new_index);
 
     println!("{}", "New session created and switched to.".green());
@@ -1075,8 +1091,7 @@ async fn handle_code_change_request(
 
     let context = prepare_context(&relevant_file_info, user_query)?;
 
-    // Generate code modifications using the AI assistant
-    let system_prompt = "You are an AI assistant that assists with code modifications. When the user provides a request, you generate the necessary code changes in unified diff format enclosed within triple backticks with 'diff' specified, like ```diff ... ```.";
+    let system_prompt = "You are an AI assistant that assists with code modifications. When the user provides a request, you generate the necessary code changes in standard unified diff format, including proper file paths and hunk headers. Enclose the diff within triple backticks with 'diff' specified, like ```diff ... ```.";
 
     let (response, _) = generate_llm_response_for_code_change(
         &context,
@@ -1092,26 +1107,25 @@ async fn handle_code_change_request(
 
 fn extract_code_changes(response: &str) -> Vec<(String, String)> {
     let mut code_changes = Vec::new();
-    let code_block_regex = Regex::new(r"(?s)```diff(.*?)```").unwrap();
+    let code_block_regex = Regex::new(r"(?s)```diff\n(.*?)\n```").unwrap();
 
     for cap in code_block_regex.captures_iter(response) {
-        let code_block = cap.get(1).unwrap().as_str().trim();
-        if code_block.starts_with("--- ") && code_block.contains("+++ ") {
-            let lines: Vec<&str> = code_block.lines().collect();
-            if lines.len() >= 3 {
-                let original_file_line = lines[0];
-                let modified_file_line = lines[1];
+        let code_block = cap.get(1).unwrap().as_str();
 
-                // Extract file paths
-                let original_file_path = original_file_line.trim_start_matches("--- ").trim();
-                let modified_file_path = modified_file_line.trim_start_matches("+++ ").trim();
+        // Reconstruct the diff
+        let diff = code_block.to_string();
 
-                // Reconstruct the diff
-                let diff = code_block.to_string();
+        // Extract file paths from the diff
+        let mut lines = code_block.lines();
+        let original_file_line = lines.next().unwrap_or("");
+        let modified_file_line = lines.next().unwrap_or("");
 
-                // For simplicity, we'll use the modified file path
-                code_changes.push((modified_file_path.to_string(), diff));
-            }
+        if original_file_line.starts_with("--- ") && modified_file_line.starts_with("+++ ") {
+            let original_file_path = original_file_line.trim_start_matches("--- ").trim();
+            let modified_file_path = modified_file_line.trim_start_matches("+++ ").trim();
+
+            // For simplicity, we'll use the modified file path
+            code_changes.push((modified_file_path.to_string(), diff));
         }
     }
 
@@ -1119,6 +1133,9 @@ fn extract_code_changes(response: &str) -> Vec<(String, String)> {
 }
 
 fn apply_diff_to_file(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Applying diff to file: {}", file_path);
+    println!("Diff content:\n{}", diff);
+
     let original_content = fs::read_to_string(file_path)?;
     let patch = Patch::from_str(diff)?;
     let new_content = diffy::apply(&original_content, &patch)?;
@@ -1160,8 +1177,12 @@ async fn process_code_changes(
 
         match confirm {
             0 => {
-                apply_diff_to_file(&file_path, &diff)?;
-                println!("{}", "Changes applied successfully.".bold().green());
+                if let Err(e) = apply_diff_to_file(&file_path, &diff) {
+                    println!("{}", format!("Failed to apply changes: {}", e).bold().red());
+                    println!("Please check the diff format and try again.");
+                } else {
+                    println!("{}", "Changes applied successfully.".bold().green());
+                }
             }
             1 => {
                 println!(
