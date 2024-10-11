@@ -520,7 +520,7 @@ async fn generate_llm_response(
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": messages,
-            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. In all your responses, keep a cool and chill vibe that is cracked and overpowered in terms of technical ability and aptitude. You are personable but not in a creepy fake way. Think L from Death Note or Gilfoyle from Silicon Valley. Dont try to be personable or cool, but also dont be too pessimistic. Don't be cringe",
+            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. ",
             "max_tokens": 4000
         }))
         .send()
