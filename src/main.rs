@@ -1,10 +1,10 @@
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
-use diffy::{apply, Patch};
+
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
-use regex::Regex;
+
 use reqwest;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::Highlighter;
@@ -20,12 +20,8 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
 use textwrap;
-use walkdir::WalkDir;
 
 const HEAVY_DOWN_AND_RIGHT: char = '┏';
 const HEAVY_DOWN_AND_LEFT: char = '┓';
@@ -33,16 +29,6 @@ const HEAVY_UP_AND_RIGHT: char = '┗';
 const HEAVY_UP_AND_LEFT: char = '┛';
 const HEAVY_HORIZONTAL: char = '━';
 const HEAVY_VERTICAL: char = '┃';
-
-const LIGHT_DOWN_AND_RIGHT: char = '┌';
-const LIGHT_DOWN_AND_LEFT: char = '┐';
-const LIGHT_UP_AND_RIGHT: char = '└';
-const LIGHT_UP_AND_LEFT: char = '┘';
-const LIGHT_HORIZONTAL: char = '─';
-const LIGHT_VERTICAL: char = '│';
-const LIGHT_VERTICAL_AND_RIGHT: char = '├';
-const LIGHT_VERTICAL_AND_LEFT: char = '┤';
-
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01"; // Add this line
 
@@ -201,25 +187,6 @@ fn load_index_cache() -> Result<Option<IndexCache>, Box<dyn std::error::Error>> 
     }
 }
 
-fn check_for_codebase_changes(
-    root_dir: &str,
-    last_modification: u64,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    for entry in WalkDir::new(root_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
-                    if modified_secs > last_modification {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-    Ok(false)
-}
-
 async fn index_codebase(
     root_dir: &str,
     api_key: &str,
@@ -310,6 +277,7 @@ fn detect_language(file_path: &str) -> String {
         "rs" => "rust",
         "py" => "python",
         "go" => "go",
+        "ts" => "typescript",
         _ => "unknown",
     }
     .to_string()
@@ -375,51 +343,6 @@ async fn calculate_relevance(summary: &str, query: &str, language: &str, api_key
     const LLM_WEIGHT: f32 = 0.7;
 
     (keyword_relevance * KEYWORD_WEIGHT) + (llm_relevance * LLM_WEIGHT)
-}
-
-async fn check_intent_to_change(
-    query: &str,
-    api_key: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let prompt = format!(
-        "Does the following query indicate an intent to change or modify code? Answer with 'yes' or 'no'.\n\nQuery: {}",
-        query
-    );
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": "claude-3-sonnet-20240229",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 100
-        }))
-        .send()
-        .await?;
-
-    let body: Value = response.json().await?;
-    let answer = body["content"][0]["text"]
-        .as_str()
-        .ok_or("Missing 'text' field in API response")?
-        .trim()
-        .to_lowercase();
-
-    Ok(answer == "yes")
-}
-
-fn apply_diff(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let original_content = fs::read_to_string(file_path)?;
-    let patch = Patch::from_str(diff)?;
-    let new_content = apply(&original_content, &patch)?;
-    fs::write(file_path, new_content)?;
-    Ok(())
 }
 
 async fn get_llm_relevance_score(
@@ -502,27 +425,6 @@ impl Chatbot {
         };
         self.sessions.push(session);
         self.current_session = Some(self.sessions.len() - 1);
-    }
-
-    fn switch_session(&mut self, index: usize) {
-        if index < self.sessions.len() {
-            self.current_session = Some(index);
-            self.index = self.sessions[index].index.clone();
-            self.memory = self.sessions[index].memory.clone();
-        }
-    }
-
-    fn get_current_session(&self) -> Option<&ConversationSession> {
-        self.current_session.map(|index| &self.sessions[index])
-    }
-
-    fn get_current_session_mut(&mut self) -> Option<&mut ConversationSession> {
-        self.current_session
-            .map(move |index| &mut self.sessions[index])
-    }
-
-    fn get_last_user_message(&self) -> Option<&Message> {
-        self.memory.iter().rev().find(|m| m.role == "user")
     }
 
     async fn chat(&mut self, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -618,7 +520,7 @@ async fn generate_llm_response(
         .json(&json!({
             "model": "claude-3-sonnet-20240229",
             "messages": messages,
-            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. In all your responses, keep a cool and chill vibe that is cracked and overpowered in terms of technical ability and aptitude. You are personable but not in a creepy fake way.",
+            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. In all your responses, keep a cool and chill vibe that is cracked and overpowered in terms of technical ability and aptitude. You are personable but not in a creepy fake way. Think L from Death Note or Gilfoyle from Silicon Valley. Dont try to be personable or cool, but also dont be too pessimistic. Don't be cringe",
             "max_tokens": 4000
         }))
         .send()
@@ -654,7 +556,7 @@ async fn generate_organized_filename(
     let client = reqwest::Client::new();
 
     let prompt = format!(
-        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. Include the .txt extension. Only return the filename, nothing else:\n\n{}",
+        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. title it in all caps and keep it from 1 to 4 words. Include the .md extension. Only return the filename, nothing else:\n\n{}",
         content
     );
 
@@ -744,15 +646,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chatbot = Chatbot::new(index.clone(), api_key.to_string());
     chatbot.create_session("Default".to_string(), index);
 
+    // Automatically load conversation history for the default session
+    if let Ok(history) = load_conversation() {
+        chatbot.memory = history;
+        println!("{}", "Conversation history loaded successfully.".green());
+    } else {
+        chatbot.memory = Vec::new();
+    }
+
     loop {
         clear_screen();
         match display_main_menu() {
             MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
-            MainMenuOption::CodeModification => {
-                immutable_code_refactoring(&mut chatbot, &mut rl).await?
-            }
             MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
-            MainMenuOption::ManageSessions => manage_sessions(&mut chatbot, &mut rl).await?,
             MainMenuOption::Help => display_help(),
             MainMenuOption::Quit => {
                 display_goodbye_message();
@@ -796,22 +702,13 @@ async fn initialize_codebase_index(
 
 enum MainMenuOption {
     Chat,
-    CodeModification,
     BrowseIndex,
-    ManageSessions,
     Help,
     Quit,
 }
 
 fn display_main_menu() -> MainMenuOption {
-    let choices = vec![
-        "Chat with AI",
-        "Code Modification Mode",
-        "Browse Index",
-        "Manage Sessions",
-        "Help",
-        "Quit",
-    ];
+    let choices = vec!["Chat with AI", "Browse Index", "Help", "Quit"];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("What would you like to do?")
         .default(0)
@@ -821,11 +718,9 @@ fn display_main_menu() -> MainMenuOption {
 
     match selection {
         0 => MainMenuOption::Chat,
-        1 => MainMenuOption::CodeModification,
-        2 => MainMenuOption::BrowseIndex,
-        3 => MainMenuOption::ManageSessions,
-        4 => MainMenuOption::Help,
-        5 => MainMenuOption::Quit,
+        1 => MainMenuOption::BrowseIndex,
+        2 => MainMenuOption::Help,
+        3 => MainMenuOption::Quit,
         _ => unreachable!(),
     }
 }
@@ -842,472 +737,37 @@ fn display_goodbye_message() {
     println!("Have a great day!");
 }
 
-async fn manage_sessions(
-    chatbot: &mut Chatbot,
-    rl: &mut Editor<MyHelper, DefaultHistory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        clear_screen();
-        print_header("Manage Sessions");
-
-        let mut choices = vec!["Create new session", "Return to main menu"];
-        for session in &chatbot.sessions {
-            choices.push(&session.name);
-        }
-
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select a session or action")
-            .default(0)
-            .items(&choices)
-            .interact()?;
-
-        if selection == 0 {
-            create_new_session(chatbot, rl).await?;
-        } else if selection == 1 {
-            break;
-        } else {
-            chatbot.switch_session(selection - 2);
-            println!(
-                "{}",
-                format!(
-                    "Switched to session: {}",
-                    chatbot.get_current_session().unwrap().name
-                )
-                .green()
-            );
-            pause();
-        }
-    }
-    Ok(())
-}
-
-async fn create_new_session(
-    chatbot: &mut Chatbot,
-    rl: &mut Editor<MyHelper, DefaultHistory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let name = rl.readline("Enter a name for the new session: ")?;
-    let root_dir = rl.readline("Enter the root directory for the new session: ")?;
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Indexing codebase for new session...");
-
-    let cache = load_index_cache()?;
-    let (new_index, _, _) = index_codebase(&root_dir, &chatbot.api_key, &pb, cache).await?;
-    chatbot.create_session(name.trim().to_string(), new_index);
-
-    println!("{}", "New session created and switched to.".green());
-    pause();
-    Ok(())
-}
-
-fn detect_file_change_request(query: &str) -> bool {
-    let patterns = [
-        r"(?i)change|modify|update|edit|alter",
-        r"(?i)file|code|implementation|function",
-    ];
-    patterns
-        .iter()
-        .all(|pattern| Regex::new(pattern).unwrap().is_match(query))
-}
-
-fn generate_diff(original: &str, modified: &str) -> String {
-    use diffy::create_patch;
-    use diffy::PatchFormatter;
-
-    let patch = create_patch(original, modified);
-    let patch_str = format!("{}", PatchFormatter::new().fmt_patch(&patch));
-    patch_str
-}
-
-fn display_colorized_diff(diff: &str) {
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++ ") {
-            println!("{}", line.green().bold());
-        } else if line.starts_with('-') && !line.starts_with("--- ") {
-            println!("{}", line.red().bold());
-        } else if line.starts_with("@@") {
-            println!("{}", line.yellow().bold());
-        } else {
-            println!("{}", line.normal());
-        }
-    }
-}
-
-fn apply_changes(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        format!("Applying changes to {}...", file_path)
-            .bold()
-            .green()
-    );
-    let original_content = fs::read_to_string(file_path)?;
-    let patch = Patch::from_str(diff)?;
-    let new_content = diffy::apply(&original_content, &patch)?;
-    fs::write(file_path, new_content)?;
-    println!("{}", "Changes applied successfully.".bold().green());
-    Ok(())
-}
-fn open_in_diff_application(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        "Opening diff in external application...".bold().yellow()
-    );
-    open_diff_in_external_app(diff)?;
-
-    let apply = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Do you want to apply the changes?")
-        .default(0)
-        .items(&["Yes", "No"])
-        .interact()?;
-
-    if apply == 0 {
-        apply_changes(file_path, diff)?;
-    } else {
-        println!(
-            "{}",
-            format!("Changes discarded for {}", file_path)
-                .bold()
-                .yellow()
-        );
-    }
-
-    Ok(())
-}
-
-fn view_full_diff(diff: &str) {
-    clear_screen();
-    print_header("Full Diff View");
-    display_colorized_diff(diff);
-    pause();
-}
-
-fn open_diff_in_external_app(diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut temp_file = NamedTempFile::new()?;
-    write!(temp_file, "{}", diff)?;
-
-    #[cfg(target_os = "macos")]
-    let diff_command = "opendiff";
-    #[cfg(target_os = "linux")]
-    let diff_command = "meld";
-    #[cfg(target_os = "windows")]
-    let diff_command = "winmerge";
-
-    Command::new(diff_command).arg(temp_file.path()).status()?;
-
-    Ok(())
-}
-
-async fn generate_llm_response_for_code_change(
-    context: &str,
-    api_key: &str,
-    conversation_history: &Vec<Message>,
-    user_query: &str,
-    system_prompt: &str,
-) -> Result<(String, bool), Box<dyn std::error::Error>> {
-    debug_print!("Generating LLM response for code change");
-    let client = reqwest::Client::new();
-
-    // Construct messages similar to the chat mode without the system prompt
-    let mut messages: Vec<Value> = conversation_history
-        .iter()
-        .map(|m| {
-            json!({
-                "role": m.role,
-                "content": m.content
-            })
-        })
-        .collect();
-
-    // Add the user's code modification request
-    messages.push(json!({
-        "role": "user",
-        "content": format!(
-            "Based on the following context, please make the requested code changes. Provide the changes in unified diff format enclosed within triple backticks with 'diff' specified. Only include the diffs necessary for the changes.\n\nContext: {}\n\nUser request: {}",
-            context, user_query
-        )
-    }));
-
-    // Send the request, including the system prompt as a top-level parameter
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": "claude-3-sonnet-20240229",
-            "system": system_prompt, // Include the system prompt here
-            "messages": messages,
-            "max_tokens": 1000
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
-
-    // Parse the response
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
-
-    debug_print!("API Response: {:?}", body);
-
-    let answer = body["content"]
-        .as_array()
-        .and_then(|arr| arr.get(0))
-        .and_then(|item| item["text"].as_str())
-        .ok_or_else(|| {
-            debug_print!("Missing 'text' field in API response: {:?}", body);
-            "Missing 'text' field in API response"
-        })?
-        .trim()
-        .to_string();
-
-    let is_complete = !body["stop_reason"].is_null() && body["stop_reason"] == "stop_sequence";
-
-    Ok((answer, is_complete))
-}
-
-async fn handle_code_change_request(
-    chatbot: &mut Chatbot,
-    user_query: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    debug_print!("Handling code change request");
-    let client = reqwest::Client::new();
-
-    // Prepare context with relevant files
-    let relevant_files = search_index(&chatbot.index, user_query, &chatbot.api_key).await;
-    let relevant_file_info: Vec<(String, String)> = relevant_files
-        .into_iter()
-        .map(|(file, _)| {
-            let (_, language) = chatbot.index.get(&file).unwrap();
-            (file, language.clone())
-        })
-        .collect();
-
-    let context = prepare_context(&relevant_file_info, user_query)?;
-
-    let system_prompt = "You are an AI assistant that assists with code modifications. When the user provides a request, you generate the necessary code changes in standard unified diff format, including proper file paths and hunk headers. Do not include any comments or explanations within the code changes. Enclose the diff within triple backticks with 'diff' specified, like ```diff ... ```.";
-
-    let (response, _) = generate_llm_response_for_code_change(
-        &context,
-        &chatbot.api_key,
-        &chatbot.memory,
-        user_query,
-        system_prompt,
-    )
-    .await?;
-
-    Ok(response)
-}
-
-fn extract_code_changes(response: &str) -> Vec<(String, String)> {
-    let mut code_changes = Vec::new();
-    let code_block_regex = Regex::new(r"(?s)```diff\n(.*?)\n```").unwrap();
-
-    for cap in code_block_regex.captures_iter(response) {
-        let code_block = cap.get(1).unwrap().as_str();
-
-        // Reconstruct the diff
-        let diff = code_block.to_string();
-        println!("Extracted diff:\n{}", diff); // Add this line
-
-        // Extract file paths from the diff
-        let mut lines = code_block.lines();
-        let original_file_line = lines.next().unwrap_or("");
-        let modified_file_line = lines.next().unwrap_or("");
-
-        if original_file_line.starts_with("--- ") && modified_file_line.starts_with("+++ ") {
-            let original_file_path = original_file_line.trim_start_matches("--- ").trim();
-            let modified_file_path = modified_file_line.trim_start_matches("+++ ").trim();
-
-            // For simplicity, we'll use the modified file path
-            code_changes.push((modified_file_path.to_string(), diff));
-        } else {
-            println!("Warning: Diff does not contain valid file headers.");
-        }
-    }
-
-    code_changes
-}
-
-fn apply_diff_to_file(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let absolute_path = fs::canonicalize(file_path)?;
-    println!("Applying diff to file: {}", absolute_path.display());
-    println!("Diff content:\n{}", diff);
-    if !Path::new(file_path).exists() {
-        println!("Error: File does not exist: {}", file_path);
-        return Err(format!("File does not exist: {}", file_path).into());
-    }
-
-    println!("Applying diff to file: {}", file_path);
-    println!("Diff content:\n{}", diff);
-
-    let original_content = fs::read_to_string(file_path)?;
-    println!("Original content length: {}", original_content.len());
-
-    let patch = Patch::from_str(diff)?;
-    let new_content = diffy::apply(&original_content, &patch)?;
-    println!("New content length: {}", new_content.len());
-
-    if let Err(e) = fs::write(file_path, &new_content) {
-        println!("Failed to write to file: {}: {}", file_path, e);
-        return Err(e.into());
-    } else {
-        println!("Changes applied to file: {}", file_path);
-    }
-
-    // Check if the new content is different from the original
-    if original_content == new_content {
-        println!("No changes were made to the file: {}", file_path);
-    } else {
-        // Pass a reference to avoid moving ownership
-        fs::write(file_path, &new_content)?;
-        println!("Changes applied to file: {}", file_path);
-    }
-
-    // Read the updated content from the file
-    let updated_content = fs::read_to_string(file_path)?;
-    println!("Updated content:\n{}", updated_content);
-
-    // If you need to write the content again, you can still use `new_content`
-    fs::write(file_path, &new_content)?;
-    println!("Successfully wrote changes to file: {}", file_path);
-
-    Ok(())
-}
-
-async fn process_code_changes(
+async fn handle_response_actions_simple(
     response: &str,
     api_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Extract code changes from the AI's response
-    let code_changes = extract_code_changes(response);
+    let action = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What would you like to do with the response?")
+        .default(0)
+        .items(&["Copy to clipboard", "Save to file", "Continue"])
+        .interact()?;
 
-    if code_changes.is_empty() {
-        println!(
-            "{}",
-            "No code changes detected in the AI's response.".yellow()
-        );
-        return Ok(());
-    }
-
-    for (file_path, diff) in code_changes {
-        println!(
-            "{}",
-            format!("Proposed changes for file: {}", file_path)
-                .bold()
-                .cyan()
-        );
-
-        display_colorized_diff(&diff);
-        println!(); // Add a newline for better readability
-
-        let confirm = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to do with these changes?")
-            .default(0)
-            .items(&["Apply changes", "Discard changes", "View full diff"])
-            .interact()?;
-
-        match confirm {
-            0 => {
-                println!("Applying changes to file: {}", file_path); // Add this line
-                if let Err(e) = apply_diff_to_file(&file_path, &diff) {
-                    println!("{}", format!("Failed to apply changes: {}", e).bold().red());
-                    println!("Please check the diff format and try again.");
-                } else {
-                    println!("{}", "Changes applied successfully.".bold().green());
-                }
-            }
-            1 => {
-                println!(
-                    "{}",
-                    format!("Changes discarded for {}", file_path)
-                        .bold()
-                        .yellow()
-                );
-            }
-            2 => {
-                view_full_diff(&diff);
-                // After viewing the full diff, ask again what to do
-                continue;
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    Ok(())
-}
-
-async fn immutable_code_refactoring(
-    chatbot: &mut Chatbot,
-    rl: &mut Editor<MyHelper, DefaultHistory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        clear_screen();
-        print_header("Immutable Code Refactoring");
-        display_chat_history(chatbot);
-
-        let user_input = rl.readline(&format!(
-            "{} ",
-            "Enter your code modification request (or type '/help' for commands):"
-                .bold()
-                .cyan()
-        ))?;
-        let user_input = user_input.trim();
-
-        match user_input {
-            "/exit" => break,
-            "/clear" => {
-                chatbot.memory.clear();
-                println!("{}", "Conversation history cleared.".bold().green());
-                continue;
-            }
-            "/help" => {
-                display_code_modification_help();
-                pause();
-                continue;
-            }
-            _ => {}
-        }
-
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap(),
-        );
-        pb.set_message("AI is processing your code modification request...");
-        pb.enable_steady_tick(std::time::Duration::from_millis(120));
-
-        // Handle code change request directly
-        let response = handle_code_change_request(chatbot, user_input).await?;
-        pb.finish_and_clear();
-
-        chatbot.memory.push(Message {
-            role: "user".to_string(),
-            content: user_input.to_string(),
-            timestamp: Utc::now(),
-        });
-        chatbot.memory.push(Message {
-            role: "assistant".to_string(),
-            content: response.clone(),
-            timestamp: Utc::now(),
-        });
-
-        // Process the AI's response to extract and apply code changes
-        process_code_changes(&response, &chatbot.api_key).await?;
+    match action {
+        0 => copy_to_clipboard(response)?,
+        1 => save_to_file(response, api_key).await?,
+        2 => {}
+        _ => unreachable!(),
     }
     Ok(())
 }
+
 async fn chat_mode(
     chatbot: &mut Chatbot,
     rl: &mut Editor<MyHelper, DefaultHistory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Automatically load conversation history at the start of chat mode
+    if let Ok(history) = load_conversation() {
+        chatbot.memory = history;
+        println!("{}", "Conversation history loaded successfully.".green());
+    } else {
+        chatbot.memory = Vec::new();
+    }
+
     loop {
         clear_screen();
         print_header("Chat with AI");
@@ -1326,6 +786,7 @@ async fn chat_mode(
             "/clear" => {
                 chatbot.memory.clear();
                 println!("{}", "Conversation history cleared.".bold().green());
+                save_conversation(&chatbot.memory)?;
                 continue;
             }
             "/help" => {
@@ -1333,14 +794,7 @@ async fn chat_mode(
                 pause();
                 continue;
             }
-            "/save" => {
-                save_conversation(&chatbot.memory)?;
-                continue;
-            }
-            "/load" => {
-                chatbot.memory = load_conversation()?;
-                continue;
-            }
+            // Remove /save and /load commands as saving/loading is now automatic
             _ => {}
         }
 
@@ -1367,131 +821,15 @@ async fn chat_mode(
             timestamp: Utc::now(),
         });
 
+        // Automatically save conversation history after each response
+        save_conversation(&chatbot.memory)?;
+
         display_ai_response(&response);
 
-        // Extract file paths and changes from the AI response
-        let changes = extract_changes_from_response(&response);
-
-        if !changes.is_empty() {
-            println!(
-                "{}",
-                "The AI has proposed changes to the project files."
-                    .bold()
-                    .yellow()
-            );
-
-            for (file_path, original, modified) in changes {
-                println!(
-                    "{}",
-                    format!("Proposed changes for file: {}", file_path)
-                        .bold()
-                        .cyan()
-                );
-                let diff = generate_diff(&original, &modified);
-                println!("Diff for {}:", file_path.bold());
-                display_colorized_diff(&diff);
-                println!(); // Add a newline for better readability
-
-                let confirm = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("What would you like to do with these changes?")
-                    .default(0)
-                    .items(&[
-                        "Apply changes",
-                        "Discard changes",
-                        "Open in diff application",
-                        "View full diff",
-                    ])
-                    .interact()?;
-
-                match confirm {
-                    0 => {
-                        apply_changes(&file_path, &diff)?;
-                    }
-                    1 => {
-                        println!(
-                            "{}",
-                            format!("Changes discarded for {}", file_path)
-                                .bold()
-                                .yellow()
-                        );
-                    }
-                    2 => {
-                        open_in_diff_application(&file_path, &diff)?;
-                        // After viewing in diff application, ask if user wants to apply changes
-                        let apply = Select::with_theme(&ColorfulTheme::default())
-                            .with_prompt("Do you want to apply the changes?")
-                            .default(0)
-                            .items(&["Yes", "No"])
-                            .interact()?;
-                        if apply == 0 {
-                            apply_changes(&file_path, &diff)?;
-                        } else {
-                            println!(
-                                "{}",
-                                format!("Changes discarded for {}", file_path)
-                                    .bold()
-                                    .yellow()
-                            );
-                        }
-                    }
-                    3 => {
-                        view_full_diff(&diff);
-                        // After viewing the full diff, ask again what to do
-                        continue;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        } else {
-            if let Err(e) = handle_response_actions(&response, &chatbot.api_key).await {
-                eprintln!("Error: {}", e);
-            }
-        }
+        // Handle response actions without diff-related options
+        handle_response_actions_simple(&response, &chatbot.api_key).await?;
     }
     Ok(())
-}
-
-fn extract_changes_from_response(response: &str) -> Vec<(String, String, String)> {
-    let mut changes = Vec::new();
-    let lines: Vec<&str> = response.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        if lines[i].ends_with(".rs") || lines[i].ends_with(".toml") {
-            let file_path = lines[i].to_string();
-            i += 1;
-            let mut original = String::new();
-            let mut modified = String::new();
-
-            while i < lines.len() && !lines[i].starts_with("<SEARCH>") {
-                i += 1;
-            }
-            i += 1;
-
-            while i < lines.len() && !lines[i].starts_with("</SEARCH>") {
-                original.push_str(lines[i]);
-                original.push('\n');
-                i += 1;
-            }
-            i += 1;
-
-            while i < lines.len() && !lines[i].starts_with("<REPLACE>") {
-                i += 1;
-            }
-            i += 1;
-
-            while i < lines.len() && !lines[i].starts_with("</REPLACE>") {
-                modified.push_str(lines[i]);
-                modified.push('\n');
-                i += 1;
-            }
-
-            changes.push((file_path, original, modified));
-        }
-        i += 1;
-    }
-
-    changes
 }
 
 fn display_chat_history(chatbot: &Chatbot) {
@@ -1505,19 +843,6 @@ fn display_chat_history(chatbot: &Chatbot) {
         println!("{}: {}", role.bold().color(color), message.content);
         println!();
     }
-}
-fn display_code_modification_help() {
-    clear_screen();
-    print_header("Code Modification Mode Help");
-    println!("In this mode, you can request code changes using natural language.");
-    println!("The AI assistant will generate the necessary code modifications.");
-    println!("You can review and apply the changes to your codebase.");
-    println!();
-    println!("Available Commands:");
-    println!("{:<15} {}", "/exit".bold(), "Return to main menu");
-    println!("{:<15} {}", "/clear".bold(), "Clear conversation history");
-    println!("{:<15} {}", "/help".bold(), "Display this help message");
-    pause();
 }
 
 fn display_chat_help() {
@@ -1540,27 +865,6 @@ fn display_ai_response(response: &str) {
         println!("  {}", line);
     }
     println!();
-}
-
-async fn handle_response_actions(
-    response: &str,
-    api_key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let action = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to do with the response?")
-            .default(0)
-            .items(&["Copy to clipboard", "Save to file", "Continue"])
-            .interact()?;
-
-        match action {
-            0 => copy_to_clipboard(response)?,
-            1 => save_to_file(response, api_key).await?,
-            2 => break,
-            _ => unreachable!(),
-        }
-    }
-    Ok(())
 }
 
 fn display_help() {
