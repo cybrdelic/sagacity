@@ -1,2 +1,5 @@
 Cargo.lock
 target/
+ai_responses/
+index_cache.json
+conversation_history.json
