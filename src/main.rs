@@ -1,12 +1,13 @@
+// src/main.rs
+
 mod constants;
+use chrono::{DateTime, Utc};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use constants::*;
 use dialoguer::{theme::ColorfulTheme, Select};
-
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
-
 use prettytable::{Cell, Row, Table};
 use reqwest;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -24,8 +25,6 @@ use std::fs::File;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
-
-use chrono::{DateTime, Utc};
 
 // Add a debug macro for easier logging
 macro_rules! debug_print {
@@ -69,7 +68,7 @@ struct ConversationSession {
     memory: Vec<Message>,
 }
 
-// Chatbot struct with API call logs
+// Chatbot struct with API call logs and file modification times
 struct Chatbot {
     index: HashMap<String, (String, String)>,
     api_key: String,
@@ -77,17 +76,23 @@ struct Chatbot {
     sessions: Vec<ConversationSession>,
     current_session: Option<usize>,
     api_call_logs: Vec<ApiCallLog>, // New field for logging API calls
+    file_mod_times: HashMap<String, u64>, // New field for file modification times
 }
 
 impl Chatbot {
-    fn new(index: HashMap<String, (String, String)>, api_key: String) -> Self {
+    fn new(
+        index: HashMap<String, (String, String)>,
+        file_mod_times: HashMap<String, u64>,
+        api_key: String,
+    ) -> Self {
         Chatbot {
             index,
             api_key,
             memory: Vec::new(),
             sessions: Vec::new(),
             current_session: None,
-            api_call_logs: Vec::new(), // Initialize the logs vector
+            api_call_logs: Vec::new(),
+            file_mod_times,
         }
     }
 
@@ -114,7 +119,7 @@ impl Chatbot {
             .into_iter()
             .filter_map(|(file, _)| {
                 match self.index.get(&file) {
-                    Some((_, language)) => Some((file, language.clone())),
+                    Some((_, language)) => Some((file.clone(), language.clone())),
                     None => {
                         debug_print!("Warning: File '{}' not found in index.", file);
                         None // Skip files not found in the index
@@ -199,13 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = "."; // Current directory
     let api_key = get_claude_api_key()?;
 
-    let index = initialize_codebase_index(root_dir, &api_key).await?;
+    let mut chatbot = initialize_codebase_index(root_dir, &api_key).await?;
 
     let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
     rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
-
-    let mut chatbot = Chatbot::new(index.clone(), api_key.to_string());
-    chatbot.create_session("Default".to_string(), index);
 
     // Automatically load conversation history for the default session
     if let Ok(history) = load_conversation() {
@@ -214,6 +216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         chatbot.memory = Vec::new();
     }
+
+    let mut chatbot = chatbot; // Make chatbot mutable
 
     loop {
         clear_screen();
@@ -383,8 +387,10 @@ async fn summarize_with_claude(
 fn load_index_cache() -> Result<Option<IndexCache>, Box<dyn std::error::Error>> {
     if let Ok(contents) = fs::read_to_string("index_cache.json") {
         let cache: IndexCache = serde_json::from_str(&contents)?;
+        debug_print!("Index cache loaded successfully.");
         Ok(Some(cache))
     } else {
+        debug_print!("No existing index cache found.");
         Ok(None)
     }
 }
@@ -401,8 +407,9 @@ fn save_index_cache(
         index: index.clone(),
         file_mod_times: file_mod_times.clone(),
     };
-    let serialized = serde_json::to_string(&cache)?;
+    let serialized = serde_json::to_string_pretty(&cache)?;
     fs::write("index_cache.json", serialized)?;
+    debug_print!("Index cache saved successfully.");
     Ok(())
 }
 
@@ -417,11 +424,7 @@ async fn index_codebase(
     Box<dyn std::error::Error>,
 > {
     let mut index = chatbot.index.clone();
-    let mut file_mod_times = chatbot
-        .api_call_logs
-        .iter()
-        .map(|log| (log.endpoint.clone(), log.response_time_ms as u64))
-        .collect::<HashMap<_, _>>();
+    let mut file_mod_times = chatbot.file_mod_times.clone(); // Correctly clone from Chatbot
 
     let walker = WalkBuilder::new(root_dir)
         .hidden(false)
@@ -472,13 +475,15 @@ async fn index_codebase(
         };
 
         if needs_reindex {
+            debug_print!("Re-indexing file: {}", file_path);
             let content = read_file_contents(&file_path)
                 .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
 
             let language = detect_language(&file_path);
             let summary = match summarize_with_claude(&content, api_key, &language, chatbot).await {
                 Ok(summary) => summary,
-                Err(_e) => {
+                Err(e) => {
+                    debug_print!("Error summarizing {}: {}", file_path, e);
                     format!(
                         "Failed to summarize. File content preview: {}",
                         &content[..std::cmp::min(content.len(), 100)]
@@ -487,8 +492,11 @@ async fn index_codebase(
             };
 
             index.insert(file_path.clone(), (summary, language));
-            file_mod_times.insert(file_path.clone(), modified_secs);
+            file_mod_times.insert(file_path.clone(), modified_secs); // Update modification time
+        } else {
+            debug_print!("Skipping file (no changes): {}", file_path);
         }
+
         pb.inc(1);
     }
 
@@ -542,9 +550,7 @@ of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
     }
 
     prompt.push_str(
-        "Provide your response in the following format:
-\n\n<file_path_1>,<relevance_score_1>\n<file_path_2>,<relevance_score_2>\n...
-\n",
+        "Provide your response in the following format:\n\n<file_path_1>,<relevance_score_1>\n<file_path_2>,<relevance_score_2>\n...\n",
     );
 
     let client = reqwest::Client::new();
@@ -615,7 +621,7 @@ of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
 async fn initialize_codebase_index(
     root_dir: &str,
     api_key: &str,
-) -> Result<HashMap<String, (String, String)>, Box<dyn std::error::Error>> {
+) -> Result<Chatbot, Box<dyn std::error::Error>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -625,16 +631,24 @@ async fn initialize_codebase_index(
     pb.set_message("Indexing codebase...");
 
     let cache = load_index_cache()?;
-    let (index, _, _) = index_codebase(
-        root_dir,
-        api_key,
-        &pb,
-        &mut Chatbot::new(HashMap::new(), api_key.to_string()),
-    )
-    .await?;
+    let index = cache.as_ref().map(|c| c.index.clone()).unwrap_or_default();
+    let file_mod_times = cache
+        .as_ref()
+        .map(|c| c.file_mod_times.clone())
+        .unwrap_or_default();
+
+    let mut chatbot = Chatbot::new(index, file_mod_times, api_key.to_string());
+
+    let (_new_index, _last_modification, updated_file_mod_times) =
+        index_codebase(root_dir, api_key, &pb, &mut chatbot).await?;
 
     pb.finish_with_message("Indexing completed");
-    Ok(index)
+
+    // Update chatbot's index and file_mod_times with new data
+    chatbot.index = _new_index;
+    chatbot.file_mod_times = updated_file_mod_times;
+
+    Ok(chatbot)
 }
 
 // Enum for main menu options
@@ -891,7 +905,7 @@ async fn generate_organized_filename(
     let client = reqwest::Client::new();
 
     let prompt = format!(
-        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. title it in all caps and keep it from 1 to 4 words. Include the .md extension. Only return the filename, nothing else:\n\n{}",
+        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. Title it in all caps and keep it from 1 to 4 words. Include the .md extension. Only return the filename, nothing else:\n\n{}",
         content
     );
 
@@ -989,7 +1003,7 @@ async fn generate_llm_response(
         .json(&json!({
             "model": DEFAULT_MODEL,
             "messages": messages,
-            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. ",
+            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions.",
             "max_tokens": DEFAULT_MAX_TOKENS
         }))
         .send()
