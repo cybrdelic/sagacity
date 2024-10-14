@@ -1,5 +1,7 @@
+mod constants;
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
+use constants::*;
 use dialoguer::{theme::ColorfulTheme, Select};
 
 use ignore::WalkBuilder;
@@ -24,15 +26,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
 
 use chrono::{DateTime, Utc};
-
-const HEAVY_DOWN_AND_RIGHT: char = '┏';
-const HEAVY_DOWN_AND_LEFT: char = '┓';
-const HEAVY_UP_AND_RIGHT: char = '┗';
-const HEAVY_UP_AND_LEFT: char = '┛';
-const HEAVY_HORIZONTAL: char = '━';
-const HEAVY_VERTICAL: char = '┃';
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01"; // Added as per initial code
 
 // Add a debug macro for easier logging
 macro_rules! debug_print {
@@ -116,14 +109,24 @@ impl Chatbot {
         let api_key_clone = self.api_key.clone();
         let relevant_files = search_index(&index_clone, user_query, &api_key_clone, self).await?;
 
-        // Step 2: Extract file paths and languages from relevant_files
+        // Step 2: Extract file paths and languages from relevant_files with proper handling
         let relevant_file_info: Vec<(String, String)> = relevant_files
             .into_iter()
-            .map(|(file, _)| {
-                let (_, language) = self.index.get(&file).unwrap();
-                (file, language.clone())
+            .filter_map(|(file, _)| {
+                match self.index.get(&file) {
+                    Some((_, language)) => Some((file, language.clone())),
+                    None => {
+                        debug_print!("Warning: File '{}' not found in index.", file);
+                        None // Skip files not found in the index
+                    }
+                }
             })
             .collect();
+
+        // Check if we have any relevant files after filtering
+        if relevant_file_info.is_empty() {
+            return Err("No relevant files found in the index for the given query.".into());
+        }
 
         // Step 3: Prepare context for the LLM
         let context = prepare_context(&relevant_file_info, user_query)?;
@@ -318,14 +321,14 @@ async fn summarize_with_claude(
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
-            "model": "claude-3-sonnet-20240229",
+            "model": DEFAULT_MODEL,
             "messages": [
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "max_tokens": 4000
+            "max_tokens": DEFAULT_MAX_TOKENS
         }))
         .send()
         .await
@@ -553,17 +556,18 @@ of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
-            "model": "claude-3-sonnet-20240229",
+            "model": DEFAULT_MODEL,
             "messages": [
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "max_tokens": 4000
+            "max_tokens": DEFAULT_MAX_TOKENS
         }))
         .send()
-        .await?;
+        .await
+        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
 
     let elapsed_time = start_time.elapsed().as_millis(); // Calculate response time
 
@@ -899,7 +903,7 @@ async fn generate_organized_filename(
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
-            "model": "claude-3-sonnet-20240229",
+            "model": DEFAULT_MODEL,
             "messages": [
                 {
                     "role": "user",
@@ -983,10 +987,10 @@ async fn generate_llm_response(
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&json!({
-            "model": "claude-3-sonnet-20240229",
+            "model": DEFAULT_MODEL,
             "messages": messages,
             "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions. ",
-            "max_tokens": 4000
+            "max_tokens": DEFAULT_MAX_TOKENS
         }))
         .send()
         .await
@@ -1100,7 +1104,7 @@ fn browse_index(index: &HashMap<String, (String, String)>) {
 
 // Function to print headers with decorative borders
 fn print_header(title: &str) {
-    let width = 60;
+    let width = HEADER_WIDTH;
     println!(
         "{}",
         HEAVY_DOWN_AND_RIGHT.to_string()
