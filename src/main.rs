@@ -1,4 +1,4 @@
-// src/main.rs// src/main.rs// src/main.rs
+// src/main.rs// src/m// src/main.rs
 
 mod constants;
 use chrono::{DateTime, Utc};
@@ -1138,7 +1138,7 @@ fn browse_index(index: &HashMap<String, (String, String)>) {
 
 // Function to print headers with decorative borders
 fn print_header(title: &str) {
-    let width = HEADER_WIDTH;
+    let width = 80; // Adjusted width for better display
     println!(
         "{}",
         HEAVY_DOWN_AND_RIGHT.to_string()
@@ -1159,43 +1159,54 @@ fn print_header(title: &str) {
     );
 }
 
-// Function to list projects in the user's home directory
+// Function to list projects in the user's home directory and subdirectories
 fn list_projects_in_home() -> Vec<PathBuf> {
     let mut projects = Vec::new();
     if let Some(home_path) = home_dir() {
-        if let Ok(entries) = fs::read_dir(home_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check if the directory contains source code files
-                    if contains_source_files(&path) {
-                        projects.push(path);
-                    }
-                }
-            }
-        }
-    }
-    projects
-}
+        // Use WalkBuilder to recursively search for directories containing source files
+        let walker = WalkBuilder::new(home_path)
+            .follow_links(false)
+            .max_depth(Some(4)) // Set maximum depth to prevent excessive recursion
+            .build();
 
-// Function to check if a directory contains source files
-fn contains_source_files(path: &PathBuf) -> bool {
-    let source_extensions = [
-        "rs", "py", "go", "js", "ts", "java", "c", "cpp", "md", "toml",
-    ];
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_file() {
-                if let Some(ext) = entry_path.extension() {
-                    if source_extensions.contains(&ext.to_string_lossy().as_ref()) {
-                        return true;
+        let source_extensions = [
+            "rs", "py", "go", "js", "ts", "java", "c", "cpp", "md", "toml",
+        ];
+
+        let mut project_paths = HashSet::new();
+
+        for entry in walker {
+            if let Ok(entry) = entry {
+                if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension() {
+                        if source_extensions.contains(&ext.to_string_lossy().as_ref()) {
+                            if let Some(parent) = path.parent() {
+                                // Add the parent directory as a project
+                                project_paths.insert(parent.to_path_buf());
+                            }
+                        }
                     }
                 }
             }
         }
+
+        projects.extend(project_paths.into_iter());
     }
-    false
+
+    // Manually add specific directories if needed
+    let additional_paths = vec![
+        "~/alexf/software-projects/.current",
+    ];
+    for path_str in additional_paths {
+        let expanded_path = shellexpand::tilde(path_str).into_owned();
+        let path = PathBuf::from(expanded_path);
+        if path.exists() && path.is_dir() {
+            projects.push(path);
+        }
+    }
+
+    projects
 }
 
 // Function to search GitHub repositories
@@ -1274,7 +1285,7 @@ async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Error>
                 }
                 let project_names: Vec<String> = projects
                     .iter()
-                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .map(|p| p.display().to_string())
                     .collect();
 
                 let project_selection = Select::with_theme(&ColorfulTheme::default())
