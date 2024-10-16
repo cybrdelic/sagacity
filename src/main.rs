@@ -1195,14 +1195,27 @@ fn list_projects_in_home() -> Vec<PathBuf> {
     }
 
     // Manually add specific directories if needed
-    let additional_paths = vec![
+   let additional_paths = vec![
         "~/alexf/software-projects/.current",
     ];
-    for path_str in additional_paths {
-        let expanded_path = shellexpand::tilde(path_str).into_owned();
-        let path = PathBuf::from(expanded_path);
-        if path.exists() && path.is_dir() {
-            projects.push(path);
+        for path_str in additional_paths {
+            let expanded_path = shellexpand::tilde(path_str).into_owned();
+            let path = PathBuf::from(expanded_path);
+            if path.exists() && path.is_dir() {
+            // For the specified .current directory, add all subdirectories
+                if path_str == "~/alexf/software-projects/.current" {
+                    if let Ok(entries) = std::fs::read_dir(&path) {
+                        for entry in entries.flatten() {
+                            if let Ok(file_type) = entry.file_type() {
+                                if file_type.is_dir() {
+                                    projects.push(entry.path());
+                                }
+                            }
+                        }
+                    }
+            } else {
+                projects.push(path);
+            }
         }
     }
 
