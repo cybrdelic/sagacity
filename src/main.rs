@@ -1,14 +1,16 @@
-// src/main.rs
+// src/main.rs// src/main.rs// src/main.rs
 
 mod constants;
 use chrono::{DateTime, Utc};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
 use constants::*;
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use home::home_dir;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use prettytable::{Cell, Row, Table};
+use reqwest::header::{ACCEPT, USER_AGENT};
 use reqwest;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::Highlighter;
@@ -23,8 +25,11 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
+use tokio;
 
 // Add a debug macro for easier logging
 macro_rules! debug_print {
@@ -49,7 +54,7 @@ struct IndexCache {
     timestamp: u64,
     last_modification: u64,
     index: HashMap<String, (String, String)>,
-    file_mod_times: HashMap<String, u64>, // Add this line
+    file_mod_times: HashMap<String, u64>,
 }
 
 // Struct for messages
@@ -75,8 +80,8 @@ struct Chatbot {
     memory: Vec<Message>,
     sessions: Vec<ConversationSession>,
     current_session: Option<usize>,
-    api_call_logs: Vec<ApiCallLog>, // New field for logging API calls
-    file_mod_times: HashMap<String, u64>, // New field for file modification times
+    api_call_logs: Vec<ApiCallLog>,
+    file_mod_times: HashMap<String, u64>,
 }
 
 impl Chatbot {
@@ -112,7 +117,8 @@ impl Chatbot {
         // Step 1: Find relevant files
         let index_clone = self.index.clone();
         let api_key_clone = self.api_key.clone();
-        let relevant_files = search_index(&index_clone, user_query, &api_key_clone, self).await?;
+        let relevant_files =
+            search_index(&index_clone, user_query, &api_key_clone, self).await?;
 
         // Step 2: Extract file paths and languages from relevant_files with proper handling
         let relevant_file_info: Vec<(String, String)> = relevant_files
@@ -130,7 +136,9 @@ impl Chatbot {
 
         // Check if we have any relevant files after filtering
         if relevant_file_info.is_empty() {
-            return Err("No relevant files found in the index for the given query.".into());
+            return Err(
+                "No relevant files found in the index for the given query.".into(),
+            );
         }
 
         // Step 3: Prepare context for the LLM
@@ -195,15 +203,26 @@ impl Completer for MyHelper {
 
 impl rustyline::Helper for MyHelper {}
 
+// Struct for GitHub repository information
+#[derive(Deserialize)]
+struct GitHubRepo {
+    full_name: String,
+    clone_url: String,
+}
+
 // Main function
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clear_screen();
     display_welcome_screen();
 
-    let root_dir = "."; // Current directory
-    let api_key = get_claude_api_key()?;
+    // Call the codebase selection menu
+    let selected_codebase = codebase_selection_menu().await?;
+    println!("Selected codebase: {:?}", selected_codebase);
 
+    // Proceed with initializing the selected codebase
+    let root_dir = selected_codebase.to_str().unwrap_or(".");
+    let api_key = get_claude_api_key()?;
     let mut chatbot = initialize_codebase_index(root_dir, &api_key).await?;
 
     let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
@@ -217,14 +236,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chatbot.memory = Vec::new();
     }
 
-    let mut chatbot = chatbot; // Make chatbot mutable
-
     loop {
         clear_screen();
         match display_main_menu() {
             MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
             MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
-            MainMenuOption::Debug => display_api_call_logs(&chatbot), // Handle Debug option
+            MainMenuOption::Debug => display_api_call_logs(&chatbot),
             MainMenuOption::Help => display_help(),
             MainMenuOption::Quit => {
                 display_goodbye_message();
@@ -308,7 +325,7 @@ async fn summarize_with_claude(
     content: &str,
     api_key: &str,
     language: &str,
-    chatbot: &mut Chatbot, // Pass mutable reference to chatbot for logging
+    chatbot: &mut Chatbot,
 ) -> Result<String, Box<dyn std::error::Error>> {
     debug_print!("Summarizing content with Claude");
     let client = reqwest::Client::new();
@@ -317,7 +334,7 @@ async fn summarize_with_claude(
         language, content
     );
 
-    let start_time = std::time::Instant::now(); // Start timing
+    let start_time = std::time::Instant::now();
 
     let response = client
         .post(CLAUDE_API_URL)
@@ -338,7 +355,7 @@ async fn summarize_with_claude(
         .await
         .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
 
-    let elapsed_time = start_time.elapsed().as_millis(); // Calculate response time
+    let elapsed_time = start_time.elapsed().as_millis();
 
     // Log the API call
     chatbot.api_call_logs.push(ApiCallLog {
@@ -418,13 +435,17 @@ async fn index_codebase(
     root_dir: &str,
     api_key: &str,
     pb: &ProgressBar,
-    chatbot: &mut Chatbot, // Pass mutable reference to chatbot for logging
+    chatbot: &mut Chatbot,
 ) -> Result<
-    (HashMap<String, (String, String)>, u64, HashMap<String, u64>),
+    (
+        HashMap<String, (String, String)>,
+        u64,
+        HashMap<String, u64>,
+    ),
     Box<dyn std::error::Error>,
 > {
     let mut index = chatbot.index.clone();
-    let mut file_mod_times = chatbot.file_mod_times.clone(); // Correctly clone from Chatbot
+    let mut file_mod_times = chatbot.file_mod_times.clone();
 
     let walker = WalkBuilder::new(root_dir)
         .hidden(false)
@@ -527,6 +548,10 @@ fn detect_language(file_path: &str) -> String {
         "py" => "python",
         "go" => "go",
         "ts" => "typescript",
+        "js" => "javascript",
+        "java" => "java",
+        "c" => "c",
+        "cpp" => "cpp",
         _ => "unknown",
     }
     .to_string()
@@ -537,11 +562,10 @@ async fn search_index(
     index: &HashMap<String, (String, String)>,
     query: &str,
     api_key: &str,
-    chatbot: &mut Chatbot, // Pass mutable reference to chatbot for logging
+    chatbot: &mut Chatbot,
 ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
     let mut prompt = format!(
-        "Based on the following query, score the relevance
-of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
+        "Based on the following query, score the relevance of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
         query
     );
 
@@ -554,7 +578,7 @@ of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
     );
 
     let client = reqwest::Client::new();
-    let start_time = std::time::Instant::now(); // Start timing
+    let start_time = std::time::Instant::now();
 
     let response = client
         .post(CLAUDE_API_URL)
@@ -575,7 +599,7 @@ of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
         .await
         .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
 
-    let elapsed_time = start_time.elapsed().as_millis(); // Calculate response time
+    let elapsed_time = start_time.elapsed().as_millis();
 
     // Log the API call
     chatbot.api_call_logs.push(ApiCallLog {
@@ -655,7 +679,7 @@ async fn initialize_codebase_index(
 enum MainMenuOption {
     Chat,
     BrowseIndex,
-    Debug, // New Debug option
+    Debug,
     Help,
     Quit,
 }
@@ -673,7 +697,7 @@ fn display_main_menu() -> MainMenuOption {
     match selection {
         0 => MainMenuOption::Chat,
         1 => MainMenuOption::BrowseIndex,
-        2 => MainMenuOption::Debug, // Handle Debug selection
+        2 => MainMenuOption::Debug,
         3 => MainMenuOption::Help,
         4 => MainMenuOption::Quit,
         _ => unreachable!(),
@@ -909,7 +933,7 @@ async fn generate_organized_filename(
         content
     );
 
-    let start_time = std::time::Instant::now(); // Start timing
+    let start_time = std::time::Instant::now();
 
     let response = client
         .post(CLAUDE_API_URL)
@@ -930,11 +954,7 @@ async fn generate_organized_filename(
         .await
         .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
 
-    let elapsed_time = start_time.elapsed().as_millis(); // Calculate response time
-
-    // Log the API call
-    // Note: Since this function doesn't have access to Chatbot, logging is skipped here.
-    // Alternatively, consider redesigning to pass &mut Chatbot if logging is required.
+    let elapsed_time = start_time.elapsed().as_millis();
 
     let body: Value = response
         .json()
@@ -972,7 +992,7 @@ async fn generate_llm_response(
     api_key: &str,
     conversation_history: &Vec<Message>,
     user_query: &str,
-    chatbot: &mut Chatbot, // Pass mutable reference to chatbot for logging
+    chatbot: &mut Chatbot,
 ) -> Result<(String, bool), Box<dyn std::error::Error>> {
     debug_print!("Generating LLM response");
     let client = reqwest::Client::new();
@@ -993,7 +1013,7 @@ async fn generate_llm_response(
         "content": format!("Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
     }));
 
-    let start_time = std::time::Instant::now(); // Start timing
+    let start_time = std::time::Instant::now();
 
     let response = client
         .post(CLAUDE_API_URL)
@@ -1010,7 +1030,7 @@ async fn generate_llm_response(
         .await
         .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
 
-    let elapsed_time = start_time.elapsed().as_millis(); // Calculate response time
+    let elapsed_time = start_time.elapsed().as_millis();
 
     // Log the API call
     chatbot.api_call_logs.push(ApiCallLog {
@@ -1044,7 +1064,7 @@ async fn generate_llm_response(
 
 // Function to chat with the system
 async fn chat_with_system(
-    chatbot: &mut Chatbot, // Pass mutable reference
+    chatbot: &mut Chatbot,
     user_query: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     chatbot.chat(user_query).await
@@ -1138,3 +1158,170 @@ fn print_header(title: &str) {
             + &HEAVY_UP_AND_LEFT.to_string()
     );
 }
+
+// Function to list projects in the user's home directory
+fn list_projects_in_home() -> Vec<PathBuf> {
+    let mut projects = Vec::new();
+    if let Some(home_path) = home_dir() {
+        if let Ok(entries) = fs::read_dir(home_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Check if the directory contains source code files
+                    if contains_source_files(&path) {
+                        projects.push(path);
+                    }
+                }
+            }
+        }
+    }
+    projects
+}
+
+// Function to check if a directory contains source files
+fn contains_source_files(path: &PathBuf) -> bool {
+    let source_extensions = [
+        "rs", "py", "go", "js", "ts", "java", "c", "cpp", "md", "toml",
+    ];
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                if let Some(ext) = entry_path.extension() {
+                    if source_extensions.contains(&ext.to_string_lossy().as_ref()) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// Function to search GitHub repositories
+async fn search_github_repos(
+    query: &str,
+) -> Result<Vec<GitHubRepo>, Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://api.github.com/search/repositories?q={}",
+        query
+    );
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .header(USER_AGENT, "CodebaseExplorer")
+        .header(ACCEPT, "application/vnd.github.v3+json")
+        .send()
+        .await?;
+
+    if res.status() == 403 {
+        return Err("GitHub API rate limit exceeded.".into());
+    }
+
+    let json: Value = res.json().await?;
+    let repos = json["items"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect();
+    Ok(repos)
+}
+
+// Function to clone a GitHub repository
+fn clone_github_repo(
+    clone_url: &str,
+    repo_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let clone_path = env::temp_dir().join(repo_name);
+    if clone_path.exists() {
+        println!("Repository already cloned.");
+    } else {
+        let status = Command::new("git")
+            .args(&["clone", clone_url, clone_path.to_str().unwrap()])
+            .status()?;
+        if !status.success() {
+            return Err("Failed to clone repository".into());
+        }
+    }
+    Ok(clone_path)
+}
+
+// Function for the codebase selection menu
+async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    loop {
+        let choices = vec!["Select from local projects", "Search GitHub", "Quit"];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Please select a codebase to index")
+            .default(0)
+            .items(&choices)
+            .interact()?;
+
+        match selection {
+            0 => {
+                let projects = list_projects_in_home();
+                if projects.is_empty() {
+                    println!("No projects found in your home directory.");
+                    if !Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Would you like to search GitHub instead?")
+                        .interact()?
+                    {
+                        continue;
+                    } else {
+                        // Switch to GitHub search
+                        continue;
+                    }
+                }
+                let project_names: Vec<String> = projects
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+
+                let project_selection = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select a project")
+                    .default(0)
+                    .items(&project_names)
+                    .interact()?;
+
+                return Ok(projects[project_selection].clone());
+            }
+            1 => {
+                let query: String = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Enter GitHub repository search query")
+                    .interact_text()?;
+
+                let repos = search_github_repos(&query).await?;
+                if repos.is_empty() {
+                    println!("No repositories found for query '{}'.", query);
+                    if !Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Would you like to try a different query?")
+                        .interact()?
+                    {
+                        continue;
+                    } else {
+                        continue;
+                    }
+                }
+                let repo_names: Vec<String> =
+                    repos.iter().map(|r| r.full_name.clone()).collect();
+
+                let repo_selection = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select a repository")
+                    .default(0)
+                    .items(&repo_names)
+                    .interact()?;
+
+                let repo = &repos[repo_selection];
+                // Clone the repository to a local directory
+                let clone_path = clone_github_repo(&repo.clone_url, &repo.full_name)?;
+                return Ok(clone_path);
+            }
+            2 => {
+                println!("Exiting...");
+                std::process::exit(0);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
