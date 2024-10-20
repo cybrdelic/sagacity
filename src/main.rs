@@ -2,8 +2,11 @@
 
 mod batch_processor;
 mod constants;
+mod github_recommendations;
 
 use batch_processor::*;
+use github_recommendations::*;
+
 use chrono::{DateTime, Utc};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
@@ -336,6 +339,8 @@ struct GitHubRepo {
     clone_url: String,
 }
 
+// src/main.rs
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clear_screen();
@@ -382,6 +387,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match display_main_menu() {
             MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
             MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
+            MainMenuOption::GitHubRecommendations => {
+                github_recommendations::generate_github_recommendations(&mut chatbot).await?
+            }
             MainMenuOption::Debug => display_api_call_logs(&chatbot),
             MainMenuOption::Help => display_help(),
             MainMenuOption::Quit => {
@@ -853,9 +861,11 @@ async fn initialize_codebase_index(
 }
 
 // Enum for main menu options
+// Enum for main menu options
 enum MainMenuOption {
     Chat,
     BrowseIndex,
+    GitHubRecommendations, // New option
     Debug,
     Help,
     Quit,
@@ -863,7 +873,14 @@ enum MainMenuOption {
 
 // Function to display the main menu
 fn display_main_menu() -> MainMenuOption {
-    let choices = vec!["Chat with AI", "Browse Index", "Debug Mode", "Help", "Quit"];
+    let choices = vec![
+        "Chat with AI",
+        "Browse Index",
+        "GitHub Recommendations", // New option
+        "Debug Mode",
+        "Help",
+        "Quit",
+    ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("What would you like to do?")
         .default(0)
@@ -874,13 +891,13 @@ fn display_main_menu() -> MainMenuOption {
     match selection {
         0 => MainMenuOption::Chat,
         1 => MainMenuOption::BrowseIndex,
-        2 => MainMenuOption::Debug,
-        3 => MainMenuOption::Help,
-        4 => MainMenuOption::Quit,
+        2 => MainMenuOption::GitHubRecommendations, // Match the new option
+        3 => MainMenuOption::Debug,
+        4 => MainMenuOption::Help,
+        5 => MainMenuOption::Quit,
         _ => unreachable!(),
     }
 }
-
 // Function to pause and wait for user input
 fn pause() {
     println!("\nPress Enter to continue...");
