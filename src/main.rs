@@ -1,11 +1,17 @@
-// src/main.rs// src/m// src/main.rs
+// src/main.rs
 
 mod batch_processor;
+mod cache;
 mod constants;
 mod github_recommendations;
+mod selection;
 
 use batch_processor::*;
+use cache::{
+    load_codebase_cache, save_codebase_cache, CodebaseCache, CACHE_EXPIRY_SECS, CACHE_FILE,
+};
 use github_recommendations::*;
+use selection::codebase_selection_menu;
 
 use chrono::{DateTime, Utc};
 use clipboard::{ClipboardContext, ClipboardProvider};
@@ -26,6 +32,8 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use shellexpand;
+use skim::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -33,9 +41,11 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
 use tokio::task::yield_now;
+
 // Add this at the top with your other use statements
 use claude_tokenizer::{count_tokens, tokenize};
 
@@ -82,7 +92,7 @@ struct ConversationSession {
     memory: Vec<Message>,
 }
 
-// Add this above your structs or in a separate module
+// Enum for token categories
 enum TokenCategory {
     Input,
     CacheWrite,
@@ -97,6 +107,7 @@ struct CostRates {
     cache_hit: f64,   // $ per million tokens
     output: f64,      // $ per million tokens
 }
+
 impl CostRates {
     fn get_rates() -> Self {
         CostRates {
@@ -107,6 +118,7 @@ impl CostRates {
         }
     }
 }
+
 #[derive(Debug)]
 struct Chatbot {
     index: HashMap<String, (String, String)>,
@@ -339,14 +351,13 @@ struct GitHubRepo {
     clone_url: String,
 }
 
-// src/main.rs
-
+// Updated main function
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clear_screen();
     display_welcome_screen();
 
-    // Call the codebase selection menu
+    // Call the codebase selection menu from the selection module
     let selected_codebase = codebase_selection_menu().await?;
     println!("Selected codebase: {:?}", selected_codebase);
 
@@ -468,7 +479,6 @@ fn scan_codebase(root_dir: &str) -> Vec<String> {
 fn read_file_contents(file_path: &str) -> Result<String, std::io::Error> {
     fs::read_to_string(file_path)
 }
-
 async fn summarize_with_claude(
     content: &str,
     api_key: &str,
@@ -673,6 +683,8 @@ async fn index_codebase(
             file_mod_times.insert(file_path.clone(), modified_secs); // Update modification time
         } else {
             debug_print!("Skipping file (no changes): {}", file_path);
+            // Update cache hit tokens if applicable
+            // Assuming cache_hit_tokens are updated elsewhere if needed
         }
 
         pb.inc(1);
@@ -826,6 +838,7 @@ async fn search_index(
     Ok(relevant_files)
 }
 
+// Function to initialize the codebase index
 async fn initialize_codebase_index(
     root_dir: &str,
     api_key: &str,
@@ -860,7 +873,6 @@ async fn initialize_codebase_index(
     Ok(chatbot)
 }
 
-// Enum for main menu options
 // Enum for main menu options
 enum MainMenuOption {
     Chat,
@@ -898,6 +910,7 @@ fn display_main_menu() -> MainMenuOption {
         _ => unreachable!(),
     }
 }
+
 // Function to pause and wait for user input
 fn pause() {
     println!("\nPress Enter to continue...");
@@ -966,90 +979,105 @@ async fn chat_mode(
 
     loop {
         clear_screen();
-        print_header("Chat with AI");
-        display_chat_history(chatbot);
+        match display_main_menu() {
+            MainMenuOption::Chat => {
+                print_header("Chat with AI");
+                display_chat_history(chatbot);
 
-        let chat_query = rl.readline(&format!(
-            "{} ",
-            "Enter your question (or type '/help' for commands):"
-                .bold()
-                .cyan()
-        ))?;
-        let chat_query = chat_query.trim();
+                let chat_query = rl.readline(&format!(
+                    "{} ",
+                    "Enter your question (or type '/help' for commands):"
+                        .bold()
+                        .cyan()
+                ))?;
+                let chat_query = chat_query.trim();
 
-        match chat_query {
-            "/exit" => break,
-            "/clear" => {
-                chatbot.memory.clear();
-                println!("{}", "Conversation history cleared.".bold().green());
+                match chat_query {
+                    "/exit" => break,
+                    "/clear" => {
+                        chatbot.memory.clear();
+                        println!("{}", "Conversation history cleared.".bold().green());
+                        save_conversation(&chatbot.memory)?;
+                        continue;
+                    }
+                    "/help" => {
+                        display_chat_help();
+                        pause();
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Create a ProgressBar with custom style
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.cyan} {msg}")
+                        .unwrap(),
+                );
+
+                // Initialize ProgressBar with the first message
+                pb.set_message("Initializing chat session...");
+                pb.enable_steady_tick(std::time::Duration::from_millis(120));
+
+                // Pass the ProgressBar to the chat function
+                let response = chatbot.chat(chat_query, &pb).await?;
+
+                pb.finish_and_clear();
+
+                chatbot.memory.push(Message {
+                    role: "user".to_string(),
+                    content: chat_query.to_string(),
+                    timestamp: Utc::now(),
+                });
+                chatbot.memory.push(Message {
+                    role: "assistant".to_string(),
+                    content: response.clone(),
+                    timestamp: Utc::now(),
+                });
+
+                // Automatically save conversation history after each response
                 save_conversation(&chatbot.memory)?;
-                continue;
+
+                display_ai_response(&response);
+
+                // Display token count and cost
+                println!("{}", "---- Token Usage ----".bold().underline());
+                println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
+                println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
+                println!(
+                    "{}: {} tokens",
+                    "Cache Write Tokens", chatbot.cache_write_tokens
+                );
+                println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
+                println!(
+                    "{}: {} tokens",
+                    "Cache Hit Tokens", chatbot.cache_hit_tokens
+                );
+                println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
+                println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
+                println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
+                println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
+                println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
+                println!("{}", "----------------------".bold().underline());
+                println!();
+
+                // Handle response actions without diff-related options
+                let api_key_clone = chatbot.api_key.clone();
+                handle_response_actions_simple(&response, &api_key_clone, chatbot).await?;
             }
-            "/help" => {
-                display_chat_help();
-                pause();
-                continue;
+            MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
+            MainMenuOption::GitHubRecommendations => {
+                github_recommendations::generate_github_recommendations(chatbot).await?
             }
-            _ => {}
+            MainMenuOption::Debug => display_api_call_logs(&chatbot),
+            MainMenuOption::Help => display_help(),
+            MainMenuOption::Quit => {
+                display_goodbye_message(&chatbot);
+                break;
+            }
         }
-
-        // Create a ProgressBar with custom style
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap(),
-        );
-
-        // Initialize ProgressBar with the first message
-        pb.set_message("Initializing chat session...");
-        pb.enable_steady_tick(std::time::Duration::from_millis(120));
-
-        // Pass the ProgressBar to the chat function
-        let response = chatbot.chat(chat_query, &pb).await?;
-
-        pb.finish_and_clear();
-
-        chatbot.memory.push(Message {
-            role: "user".to_string(),
-            content: chat_query.to_string(),
-            timestamp: Utc::now(),
-        });
-        chatbot.memory.push(Message {
-            role: "assistant".to_string(),
-            content: response.clone(),
-            timestamp: Utc::now(),
-        });
-
-        // Automatically save conversation history after each response
-        save_conversation(&chatbot.memory)?;
-
-        display_ai_response(&response);
-
-        // Display token count and cost
-        println!("{}", "---- Token Usage ----".bold().underline());
-        println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
-        println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
-        println!(
-            "{}: {} tokens",
-            "Cache Write Tokens", chatbot.cache_write_tokens
-        );
-        println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
-        println!(
-            "{}: {} tokens",
-            "Cache Hit Tokens", chatbot.cache_hit_tokens
-        );
-        println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
-        println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
-        println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
-        println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
-        println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
-        println!("{}", "----------------------".bold().underline());
-        println!();
-
-        // Handle response actions without diff-related options
-        let api_key_clone = chatbot.api_key.clone();
-        handle_response_actions_simple(&response, &api_key_clone, chatbot).await?;
+        pause();
     }
     Ok(())
 }
@@ -1217,10 +1245,15 @@ async fn generate_organized_filename(
         .trim()
         .to_string();
 
+    // Tokenize the filename and update output tokens
+    let filename_tokens = count_tokens(&filename)?;
+    chatbot.update_tokens(TokenCategory::Output, filename_tokens);
+    debug_print!("Filename tokens: {}", filename_tokens);
+
     Ok(filename)
 }
 
-// Function to prepare context for the LLM
+// Function to generate the context for the AI
 fn prepare_context(
     relevant_files: &[(String, String)],
     user_query: &str,
@@ -1236,6 +1269,7 @@ fn prepare_context(
     Ok(context)
 }
 
+// Function to generate LLM response using Claude API
 async fn generate_llm_response(
     context: &str,
     api_key: &str,
@@ -1451,6 +1485,11 @@ fn print_header(title: &str) {
 
 // Function to list projects in the user's home directory and subdirectories
 fn list_projects_in_home() -> Vec<PathBuf> {
+    // Attempt to load cache
+    if let Some(cache) = cache::load_codebase_cache() {
+        return cache.codebases.iter().map(|p| PathBuf::from(p)).collect();
+    }
+
     let mut projects = Vec::new();
     if let Some(home_path) = home_dir() {
         // Use WalkBuilder to recursively search for directories containing source files
@@ -1492,7 +1531,7 @@ fn list_projects_in_home() -> Vec<PathBuf> {
         if path.exists() && path.is_dir() {
             // For the specified .current directory, add all subdirectories
             if path_str == "~/alexf/software-projects/.current" {
-                if let Ok(entries) = std::fs::read_dir(&path) {
+                if let Ok(entries) = fs::read_dir(&path) {
                     for entry in entries.flatten() {
                         if let Ok(file_type) = entry.file_type() {
                             if file_type.is_dir() {
@@ -1505,6 +1544,17 @@ fn list_projects_in_home() -> Vec<PathBuf> {
                 projects.push(path);
             }
         }
+    }
+
+    // Convert PathBuf to String for caching
+    let codebase_strings: Vec<String> = projects
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    // Save to cache
+    if let Err(e) = cache::save_codebase_cache(&codebase_strings) {
+        debug_print!("Failed to save codebase cache: {}", e);
     }
 
     projects
@@ -1552,79 +1602,4 @@ fn clone_github_repo(
         }
     }
     Ok(clone_path)
-}
-
-// Function for the codebase selection menu
-async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    loop {
-        let choices = vec!["Select from local projects", "Search GitHub", "Quit"];
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Please select a codebase to index")
-            .default(0)
-            .items(&choices)
-            .interact()?;
-
-        match selection {
-            0 => {
-                let projects = list_projects_in_home();
-                if projects.is_empty() {
-                    println!("No projects found in your home directory.");
-                    if !Confirm::with_theme(&ColorfulTheme::default())
-                        .with_prompt("Would you like to search GitHub instead?")
-                        .interact()?
-                    {
-                        continue;
-                    } else {
-                        // Switch to GitHub search
-                        continue;
-                    }
-                }
-                let project_names: Vec<String> =
-                    projects.iter().map(|p| p.display().to_string()).collect();
-
-                let project_selection = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select a project")
-                    .default(0)
-                    .items(&project_names)
-                    .interact()?;
-
-                return Ok(projects[project_selection].clone());
-            }
-            1 => {
-                let query: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Enter GitHub repository search query")
-                    .interact_text()?;
-
-                let repos = search_github_repos(&query).await?;
-                if repos.is_empty() {
-                    println!("No repositories found for query '{}'.", query);
-                    if !Confirm::with_theme(&ColorfulTheme::default())
-                        .with_prompt("Would you like to try a different query?")
-                        .interact()?
-                    {
-                        continue;
-                    } else {
-                        continue;
-                    }
-                }
-                let repo_names: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
-
-                let repo_selection = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select a repository")
-                    .default(0)
-                    .items(&repo_names)
-                    .interact()?;
-
-                let repo = &repos[repo_selection];
-                // Clone the repository to a local directory
-                let clone_path = clone_github_repo(&repo.clone_url, &repo.full_name)?;
-                return Ok(clone_path);
-            }
-            2 => {
-                println!("Exiting...");
-                std::process::exit(0);
-            }
-            _ => unreachable!(),
-        }
-    }
 }

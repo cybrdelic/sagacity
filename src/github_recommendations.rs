@@ -2,7 +2,9 @@
 
 use crate::clone_github_repo;
 use crate::constants::*;
+use crate::generate_llm_response;
 use crate::Chatbot;
+use crate::summarize_with_claude;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
