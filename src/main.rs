@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
-use tokio;
+use tokio::task::yield_now;
 
 // Add a debug macro for easier logging
 macro_rules! debug_print {
@@ -111,15 +111,26 @@ impl Chatbot {
         self.current_session = Some(self.sessions.len() - 1);
     }
 
-    async fn chat(&mut self, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
+    async fn chat(
+        &mut self,
+        user_query: &str,
+        pb: &ProgressBar,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         debug_print!("Starting chat with system");
 
         // Step 1: Find relevant files
+        pb.set_message("Generating index relevance scores...");
+        pb.tick();
+        yield_now().await;
         let index_clone = self.index.clone();
         let api_key_clone = self.api_key.clone();
-        let relevant_files = search_index(&index_clone, user_query, &api_key_clone, self).await?;
+        let relevant_files =
+            search_index(&index_clone, user_query, &api_key_clone, self, pb).await?;
 
         // Step 2: Extract file paths and languages from relevant_files with proper handling
+        pb.set_message("Extracting file information...");
+        pb.tick();
+        yield_now().await;
         let relevant_file_info: Vec<(String, String)> = relevant_files
             .into_iter()
             .filter_map(|(file, _)| {
@@ -135,20 +146,38 @@ impl Chatbot {
 
         // Check if we have any relevant files after filtering
         if relevant_file_info.is_empty() {
+            pb.set_message("No relevant files found for the query.");
+            pb.tick();
+            yield_now().await;
             return Err("No relevant files found in the index for the given query.".into());
         }
 
         // Step 3: Prepare context for the LLM
+        pb.set_message("Preparing context for AI...");
+        pb.tick();
+        yield_now().await;
         let context = prepare_context(&relevant_file_info, user_query)?;
 
         // Step 4: Generate response using the LLM
+        pb.set_message("Composing final response...");
+        pb.tick();
+        yield_now().await;
         let api_key_clone = self.api_key.clone();
         let memory_clone = self.memory.clone();
-        let (response, _) =
-            generate_llm_response(&context, &api_key_clone, &memory_clone, user_query, self)
-                .await?;
+        let (response, _) = generate_llm_response(
+            &context,
+            &api_key_clone,
+            &memory_clone,
+            user_query,
+            self,
+            pb,
+        )
+        .await?;
 
         // Step 5: Update conversation history
+        pb.set_message("Updating conversation history...");
+        pb.tick();
+        yield_now().await;
         self.memory.push(Message {
             role: "user".to_string(),
             content: user_query.to_string(),
@@ -556,7 +585,12 @@ async fn search_index(
     query: &str,
     api_key: &str,
     chatbot: &mut Chatbot,
+    pb: &ProgressBar, // Added ProgressBar parameter
 ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
+    pb.set_message("Searching index...");
+    pb.tick();
+    yield_now().await;
+
     let mut prompt = format!(
         "Based on the following query, score the relevance of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
         query
@@ -569,6 +603,10 @@ async fn search_index(
     prompt.push_str(
         "Provide your response in the following format:\n\n<file_path_1>,<relevance_score_1>\n<file_path_2>,<relevance_score_2>\n...\n",
     );
+
+    pb.set_message("Sending request to Claude API for relevance scoring...");
+    pb.tick();
+    yield_now().await;
 
     let client = reqwest::Client::new();
     let start_time = std::time::Instant::now();
@@ -610,6 +648,9 @@ async fn search_index(
             .await
             .map_err(|e| format!("Failed to read error response body: {}", e))?;
         debug_print!("Error response body: {}", error_body);
+        pb.set_message("Failed to score relevance with Claude API.");
+        pb.tick();
+        yield_now().await;
         return Err(format!("Claude API request failed: {} - {}", status, error_body).into());
     }
 
@@ -632,6 +673,11 @@ async fn search_index(
 
     relevant_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     relevant_files.truncate(5); // Limit to top 5 most relevant files
+
+    pb.set_message("Relevance scoring completed.");
+    pb.tick();
+    yield_now().await;
+
     Ok(relevant_files)
 }
 
@@ -731,7 +777,6 @@ async fn handle_response_actions_simple(
     Ok(())
 }
 
-// Function to handle chat mode
 async fn chat_mode(
     chatbot: &mut Chatbot,
     rl: &mut Editor<MyHelper, DefaultHistory>,
@@ -773,16 +818,21 @@ async fn chat_mode(
             _ => {}
         }
 
+        // Create a ProgressBar with custom style
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
                 .unwrap(),
         );
-        pb.set_message("AI is analyzing your request...");
+
+        // Initialize ProgressBar with the first message
+        pb.set_message("Initializing chat session...");
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        let response = chat_with_system(chatbot, chat_query).await?;
+        // Pass the ProgressBar to the chat function
+        let response = chatbot.chat(chat_query, &pb).await?;
+
         pb.finish_and_clear();
 
         chatbot.memory.push(Message {
@@ -986,8 +1036,12 @@ async fn generate_llm_response(
     conversation_history: &Vec<Message>,
     user_query: &str,
     chatbot: &mut Chatbot,
+    pb: &ProgressBar, // Added ProgressBar parameter
 ) -> Result<(String, bool), Box<dyn std::error::Error>> {
-    debug_print!("Generating LLM response");
+    pb.set_message("Generating LLM response...");
+    pb.tick();
+    yield_now().await;
+
     let client = reqwest::Client::new();
 
     let mut messages: Vec<Value> = conversation_history
@@ -1005,6 +1059,10 @@ async fn generate_llm_response(
         "role": "user",
         "content": format!("Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
     }));
+
+    pb.set_message("Sending request to Claude API for response generation...");
+    pb.tick();
+    yield_now().await;
 
     let start_time = std::time::Instant::now();
 
@@ -1034,13 +1092,20 @@ async fn generate_llm_response(
         response_time_ms: elapsed_time,
     });
 
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read error response body: {}", e))?;
+        debug_print!("Error response body: {}", error_body);
+        pb.set_message("Failed to generate response with Claude API.");
+        pb.tick();
+        yield_now().await;
+        return Err(format!("Claude API request failed: {} - {}", status, error_body).into());
+    }
 
-    debug_print!("API Response: {:?}", body);
-
+    let body: Value = response.json().await?;
     let answer = body["content"][0]["text"]
         .as_str()
         .ok_or_else(|| {
@@ -1052,6 +1117,10 @@ async fn generate_llm_response(
 
     let is_complete = !body["stop_reason"].is_null() && body["stop_reason"] == "stop_sequence";
 
+    pb.set_message("LLM response generated successfully.");
+    pb.tick();
+    yield_now().await;
+
     Ok((answer, is_complete))
 }
 
@@ -1060,7 +1129,14 @@ async fn chat_with_system(
     chatbot: &mut Chatbot,
     user_query: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    chatbot.chat(user_query).await
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Chatting with system...");
+    chatbot.chat(user_query, &pb).await
 }
 
 // Function to display API call logs in a table
