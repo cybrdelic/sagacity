@@ -30,6 +30,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use textwrap;
 use tokio::task::yield_now;
+// Add this at the top with your other use statements
+use claude_tokenizer::{count_tokens, tokenize};
 
 // Add a debug macro for easier logging
 macro_rules! debug_print {
@@ -82,6 +84,8 @@ struct Chatbot {
     current_session: Option<usize>,
     api_call_logs: Vec<ApiCallLog>,
     file_mod_times: HashMap<String, u64>,
+    total_tokens: usize, // New field to track total tokens
+    token_cost: f64,
 }
 
 impl Chatbot {
@@ -98,7 +102,16 @@ impl Chatbot {
             current_session: None,
             api_call_logs: Vec::new(),
             file_mod_times,
+            total_tokens: 0, // Initialize to zero
+            token_cost: 0.0,
         }
+    }
+
+    // Optional: Function to update token counts and cost
+    fn update_tokens(&mut self, tokens: usize) {
+        self.total_tokens += tokens;
+        // Assuming a cost of $0.0001 per token (replace with actual rate)
+        self.token_cost += tokens as f64 * 0.0001;
     }
 
     fn create_session(&mut self, name: String, index: HashMap<String, (String, String)>) {
@@ -360,6 +373,11 @@ async fn summarize_with_claude(
         language, content
     );
 
+    // Tokenize the prompt
+    let prompt_tokens = count_tokens(&prompt)?;
+    chatbot.update_tokens(prompt_tokens);
+    debug_print!("Prompt tokens: {}", prompt_tokens);
+
     let start_time = std::time::Instant::now();
 
     let response = client
@@ -596,6 +614,11 @@ async fn search_index(
         query
     );
 
+    // Tokenize the prompt
+    let prompt_tokens = count_tokens(&prompt)?;
+    chatbot.update_tokens(prompt_tokens);
+    debug_print!("Prompt tokens: {}", prompt_tokens);
+
     for (file, (summary, _)) in index {
         prompt.push_str(&format!("Summary for {}: {}\n\n", file, summary));
     }
@@ -761,6 +784,7 @@ fn display_goodbye_message() {
 async fn handle_response_actions_simple(
     response: &str,
     api_key: &str,
+    chatbot: &mut Chatbot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let action = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("What would you like to do with the response?")
@@ -770,7 +794,7 @@ async fn handle_response_actions_simple(
 
     match action {
         0 => copy_to_clipboard(response)?,
-        1 => save_to_file(response, api_key).await?,
+        1 => save_to_file(response, api_key, chatbot).await?,
         2 => {}
         _ => unreachable!(),
     }
@@ -852,7 +876,8 @@ async fn chat_mode(
         display_ai_response(&response);
 
         // Handle response actions without diff-related options
-        handle_response_actions_simple(&response, &chatbot.api_key).await?;
+        let api_key_clone = chatbot.api_key.clone();
+        handle_response_actions_simple(&response, &api_key_clone, chatbot).await?;
     }
     Ok(())
 }
@@ -952,8 +977,12 @@ fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Function to save text to a file
-async fn save_to_file(text: &str, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let filename = generate_organized_filename(api_key, text).await?;
+async fn save_to_file(
+    text: &str,
+    api_key: &str,
+    chatbot: &mut Chatbot,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let filename = generate_organized_filename(api_key, text, chatbot).await?;
     let output_dir = "ai_responses";
     fs::create_dir_all(output_dir)?;
     let file_path = format!("{}/{}", output_dir, filename);
@@ -967,6 +996,7 @@ async fn save_to_file(text: &str, api_key: &str) -> Result<(), Box<dyn std::erro
 async fn generate_organized_filename(
     api_key: &str,
     content: &str,
+    chatbot: &mut Chatbot,
 ) -> Result<String, Box<dyn std::error::Error>> {
     debug_print!("Generating organized filename");
     let client = reqwest::Client::new();
@@ -975,6 +1005,11 @@ async fn generate_organized_filename(
         "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. Title it in all caps and keep it from 1 to 4 words. Include the .md extension. Only return the filename, nothing else:\n\n{}",
         content
     );
+
+    // Tokenize the prompt
+    let prompt_tokens = count_tokens(&prompt)?;
+    chatbot.update_tokens(prompt_tokens);
+    debug_print!("Prompt tokens: {}", prompt_tokens);
 
     let start_time = std::time::Instant::now();
 
