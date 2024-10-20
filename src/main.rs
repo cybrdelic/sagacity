@@ -1,6 +1,9 @@
 // src/main.rs// src/m// src/main.rs
 
+mod batch_processor;
 mod constants;
+
+use batch_processor::*;
 use chrono::{DateTime, Utc};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::Colorize;
@@ -69,13 +72,39 @@ struct Message {
 }
 
 // Struct for conversation sessions
+#[derive(Debug)]
 struct ConversationSession {
     name: String,
     index: HashMap<String, (String, String)>,
     memory: Vec<Message>,
 }
 
-// Chatbot struct with API call logs and file modification times
+// Add this above your structs or in a separate module
+enum TokenCategory {
+    Input,
+    CacheWrite,
+    CacheHit,
+    Output,
+}
+
+#[derive(Debug)]
+struct CostRates {
+    input: f64,       // $ per million tokens
+    cache_write: f64, // $ per million tokens
+    cache_hit: f64,   // $ per million tokens
+    output: f64,      // $ per million tokens
+}
+impl CostRates {
+    fn get_rates() -> Self {
+        CostRates {
+            input: 3.00,
+            cache_write: 3.75,
+            cache_hit: 0.30,
+            output: 15.00,
+        }
+    }
+}
+#[derive(Debug)]
 struct Chatbot {
     index: HashMap<String, (String, String)>,
     api_key: String,
@@ -84,8 +113,22 @@ struct Chatbot {
     current_session: Option<usize>,
     api_call_logs: Vec<ApiCallLog>,
     file_mod_times: HashMap<String, u64>,
-    total_tokens: usize, // New field to track total tokens
-    token_cost: f64,
+
+    // Token tracking fields
+    input_tokens: usize,
+    cache_write_tokens: usize,
+    cache_hit_tokens: usize,
+    output_tokens: usize,
+
+    // Cost tracking fields
+    input_cost: f64,
+    cache_write_cost: f64,
+    cache_hit_cost: f64,
+    output_cost: f64,
+
+    // Cost rates based on model
+    cost_rates: CostRates,
+    batch_processor: BatchProcessor,
 }
 
 impl Chatbot {
@@ -102,26 +145,65 @@ impl Chatbot {
             current_session: None,
             api_call_logs: Vec::new(),
             file_mod_times,
-            total_tokens: 0, // Initialize to zero
-            token_cost: 0.0,
+
+            // Initialize token counts and costs
+            input_tokens: 0,
+            cache_write_tokens: 0,
+            cache_hit_tokens: 0,
+            output_tokens: 0,
+            input_cost: 0.0,
+            cache_write_cost: 0.0,
+            cache_hit_cost: 0.0,
+            output_cost: 0.0,
+            // Initialize cost rates
+            cost_rates: CostRates::get_rates(),
+            // Initialize batch processor
+            batch_processor: BatchProcessor::new(),
         }
     }
 
-    // Optional: Function to update token counts and cost
-    fn update_tokens(&mut self, tokens: usize) {
-        self.total_tokens += tokens;
-        // Assuming a cost of $0.0001 per token (replace with actual rate)
-        self.token_cost += tokens as f64 * 0.0001;
+    /// Update tokens and calculate costs based on the category
+    fn update_tokens(&mut self, category: TokenCategory, tokens: usize) {
+        match category {
+            TokenCategory::Input => {
+                self.input_tokens += tokens;
+                self.input_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.input;
+            }
+            TokenCategory::CacheWrite => {
+                self.cache_write_tokens += tokens;
+                self.cache_write_cost +=
+                    (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_write;
+            }
+            TokenCategory::CacheHit => {
+                self.cache_hit_tokens += tokens;
+                self.cache_hit_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_hit;
+            }
+            TokenCategory::Output => {
+                self.output_tokens += tokens;
+                self.output_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.output;
+            }
+        }
     }
 
-    fn create_session(&mut self, name: String, index: HashMap<String, (String, String)>) {
-        let session = ConversationSession {
-            name,
-            index,
-            memory: Vec::new(),
-        };
-        self.sessions.push(session);
-        self.current_session = Some(self.sessions.len() - 1);
+    /// Calculate total tokens and total cost
+    fn total_tokens(&self) -> usize {
+        self.input_tokens + self.cache_write_tokens + self.cache_hit_tokens + self.output_tokens
+    }
+
+    fn total_cost(&self) -> f64 {
+        self.input_cost + self.cache_write_cost + self.cache_hit_cost + self.output_cost
+    }
+
+    async fn process_batch(&mut self, batch: Vec<String>) {
+        // Implement the logic to handle a batch of queries
+        for query in batch {
+            // Process each query as per existing chat logic
+            // For simplicity, we'll call the `chat` function for each
+            // In a real-world scenario, you might optimize this
+            if let Err(e) = self.chat(&query, &ProgressBar::hidden()).await {
+                eprintln!("Error processing query '{}': {}", query, e);
+            }
+        }
     }
 
     async fn chat(
@@ -170,6 +252,11 @@ impl Chatbot {
         pb.tick();
         yield_now().await;
         let context = prepare_context(&relevant_file_info, user_query)?;
+
+        // Tokenize the context and update input tokens
+        let context_tokens = count_tokens(&context)?;
+        self.update_tokens(TokenCategory::Input, context_tokens);
+        debug_print!("Context tokens: {}", context_tokens);
 
         // Step 4: Generate response using the LLM
         pb.set_message("Composing final response...");
@@ -249,7 +336,6 @@ struct GitHubRepo {
     clone_url: String,
 }
 
-// Main function
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clear_screen();
@@ -259,10 +345,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selected_codebase = codebase_selection_menu().await?;
     println!("Selected codebase: {:?}", selected_codebase);
 
+    // Select model
+    let models = vec![
+        "Claude 3.5 Sonnet",
+        "Claude 3 Opus",
+        "Claude 3 Sonnet",
+        "Claude 3 Haiku",
+    ];
+    let model_selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select a Claude Model Tier")
+        .default(0)
+        .items(&models)
+        .interact()?;
+
+    let selected_model = models[model_selection];
+    println!("Selected model: {}", selected_model);
+
     // Proceed with initializing the selected codebase
     let root_dir = selected_codebase.to_str().unwrap_or(".");
     let api_key = get_claude_api_key()?;
-    let mut chatbot = initialize_codebase_index(root_dir, &api_key).await?;
+    let mut chatbot = initialize_codebase_index(root_dir, &api_key, selected_model).await?;
 
     let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
     rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
@@ -283,7 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MainMenuOption::Debug => display_api_call_logs(&chatbot),
             MainMenuOption::Help => display_help(),
             MainMenuOption::Quit => {
-                display_goodbye_message();
+                display_goodbye_message(&chatbot);
                 break;
             }
         }
@@ -359,7 +461,6 @@ fn read_file_contents(file_path: &str) -> Result<String, std::io::Error> {
     fs::read_to_string(file_path)
 }
 
-// Function to summarize content with Claude API
 async fn summarize_with_claude(
     content: &str,
     api_key: &str,
@@ -373,9 +474,9 @@ async fn summarize_with_claude(
         language, content
     );
 
-    // Tokenize the prompt
+    // Tokenize the prompt and update input tokens
     let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(prompt_tokens);
+    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
     debug_print!("Prompt tokens: {}", prompt_tokens);
 
     let start_time = std::time::Instant::now();
@@ -437,10 +538,18 @@ async fn summarize_with_claude(
         .ok_or("Missing 'text' field in API response")?
         .trim()
         .to_string();
+
     if summary.is_empty() {
         return Err("Empty summary received from Claude API".into());
     }
+
     debug_print!("Received summary: {}", summary);
+
+    // Tokenize the response and update output tokens
+    let response_tokens = count_tokens(&summary)?;
+    chatbot.update_tokens(TokenCategory::Output, response_tokens);
+    debug_print!("Response tokens: {}", response_tokens);
+
     Ok(summary)
 }
 
@@ -614,11 +723,6 @@ async fn search_index(
         query
     );
 
-    // Tokenize the prompt
-    let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(prompt_tokens);
-    debug_print!("Prompt tokens: {}", prompt_tokens);
-
     for (file, (summary, _)) in index {
         prompt.push_str(&format!("Summary for {}: {}\n\n", file, summary));
     }
@@ -626,6 +730,11 @@ async fn search_index(
     prompt.push_str(
         "Provide your response in the following format:\n\n<file_path_1>,<relevance_score_1>\n<file_path_2>,<relevance_score_2>\n...\n",
     );
+
+    // Tokenize the prompt and update input tokens
+    let prompt_tokens = count_tokens(&prompt)?;
+    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
+    debug_print!("Search index prompt tokens: {}", prompt_tokens);
 
     pb.set_message("Sending request to Claude API for relevance scoring...");
     pb.tick();
@@ -701,12 +810,18 @@ async fn search_index(
     pb.tick();
     yield_now().await;
 
+    // Tokenize the response and update output tokens
+    let response_tokens = count_tokens(&response_text)?;
+    chatbot.update_tokens(TokenCategory::Output, response_tokens);
+    debug_print!("Relevance scoring response tokens: {}", response_tokens);
+
     Ok(relevant_files)
 }
 
 async fn initialize_codebase_index(
     root_dir: &str,
     api_key: &str,
+    model: &str, // Add model parameter
 ) -> Result<Chatbot, Box<dyn std::error::Error>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -773,11 +888,30 @@ fn pause() {
     std::io::stdin().read_line(&mut input).unwrap();
 }
 
-// Function to display goodbye message
-fn display_goodbye_message() {
+fn display_goodbye_message(chatbot: &Chatbot) {
     clear_screen();
     println!("{}", "Thank you for using Codebase Explorer".bold().green());
     println!("Have a great day!");
+    println!();
+    println!("{}", "---- Token Usage Summary ----".bold().underline());
+    println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
+    println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
+    println!(
+        "{}: {} tokens",
+        "Cache Write Tokens", chatbot.cache_write_tokens
+    );
+    println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
+    println!(
+        "{}: {} tokens",
+        "Cache Hit Tokens", chatbot.cache_hit_tokens
+    );
+    println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
+    println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
+    println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
+    println!();
+    println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
+    println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
+    println!("{}", "------------------------------".bold().underline());
 }
 
 // Function to handle response actions (copy to clipboard, save to file, continue)
@@ -874,6 +1008,27 @@ async fn chat_mode(
         save_conversation(&chatbot.memory)?;
 
         display_ai_response(&response);
+
+        // Display token count and cost
+        println!("{}", "---- Token Usage ----".bold().underline());
+        println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
+        println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
+        println!(
+            "{}: {} tokens",
+            "Cache Write Tokens", chatbot.cache_write_tokens
+        );
+        println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
+        println!(
+            "{}: {} tokens",
+            "Cache Hit Tokens", chatbot.cache_hit_tokens
+        );
+        println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
+        println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
+        println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
+        println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
+        println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
+        println!("{}", "----------------------".bold().underline());
+        println!();
 
         // Handle response actions without diff-related options
         let api_key_clone = chatbot.api_key.clone();
@@ -1008,7 +1163,7 @@ async fn generate_organized_filename(
 
     // Tokenize the prompt
     let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(prompt_tokens);
+    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
     debug_print!("Prompt tokens: {}", prompt_tokens);
 
     let start_time = std::time::Instant::now();
@@ -1064,7 +1219,6 @@ fn prepare_context(
     Ok(context)
 }
 
-// Function to generate LLM response using Claude API
 async fn generate_llm_response(
     context: &str,
     api_key: &str,
@@ -1090,10 +1244,20 @@ async fn generate_llm_response(
         .collect();
 
     // Add the current context and user query
+    let user_content = format!(
+        "Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}",
+        context, user_query
+    );
+
     messages.push(json!({
         "role": "user",
-        "content": format!("Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}", context, user_query)
+        "content": user_content
     }));
+
+    // Tokenize the user content and update input tokens
+    let user_tokens = count_tokens(&user_content)?;
+    chatbot.update_tokens(TokenCategory::Input, user_tokens);
+    debug_print!("User query tokens: {}", user_tokens);
 
     pb.set_message("Sending request to Claude API for response generation...");
     pb.tick();
@@ -1155,6 +1319,11 @@ async fn generate_llm_response(
     pb.set_message("LLM response generated successfully.");
     pb.tick();
     yield_now().await;
+
+    // Tokenize the AI response and update output tokens
+    let response_tokens = count_tokens(&answer)?;
+    chatbot.update_tokens(TokenCategory::Output, response_tokens);
+    debug_print!("AI response tokens: {}", response_tokens);
 
     Ok((answer, is_complete))
 }
