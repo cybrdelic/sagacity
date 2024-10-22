@@ -6,7 +6,7 @@ const MAX_BATCH_SIZE: usize = 10;
 // Define the batch interval in seconds
 const BATCH_INTERVAL: u64 = 5;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BatchProcessor {
     sender: mpsc::Sender<String>,
 }
