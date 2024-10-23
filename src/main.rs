@@ -1,3 +1,7 @@
+mod app_state;
+
+use app_state::AppState;
+
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers,
@@ -417,18 +421,7 @@ fn draw_quit_confirm(f: &mut Frame<'_>, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-/// Represents the different states of the application
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppState {
-    MainMenu,
-    Chat,
-    BrowseIndex,
-    GitHubRecommendations,
-    Help,
-    Settings,
-    QuitConfirm,
-    Quit,
-}
+
 
 /// Represents the sender of a message
 #[derive(Debug, Clone, PartialEq, Eq)]
