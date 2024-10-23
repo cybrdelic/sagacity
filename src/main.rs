@@ -1,1605 +1,829 @@
-// src/main.rs
-
-mod batch_processor;
-mod cache;
-mod constants;
-mod github_recommendations;
-mod selection;
-
-use batch_processor::*;
-use cache::{
-    load_codebase_cache, save_codebase_cache, CodebaseCache, CACHE_EXPIRY_SECS, CACHE_FILE,
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use github_recommendations::*;
-use selection::codebase_selection_menu;
-
-use chrono::{DateTime, Utc};
-use clipboard::{ClipboardContext, ClipboardProvider};
-use colored::Colorize;
-use constants::*;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
-use home::home_dir;
-use ignore::WalkBuilder;
-use indicatif::{ProgressBar, ProgressStyle};
-use prettytable::{Cell, Row, Table};
-use reqwest;
-use reqwest::header::{ACCEPT, USER_AGENT};
-use rustyline::completion::{Completer, FilenameCompleter, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
-use rustyline::{Context, Editor};
+use log::{error, info};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    Frame, Terminal,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use shellexpand;
-use skim::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::fs;
-use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
-use textwrap;
-use tokio::task::yield_now;
+use std::{
+    env,
+    error::Error as StdError,
+    fmt::{self, Display, Formatter},
+    fs, io,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc;
+use tokio::time;
 
-// Add this at the top with your other use statements
-use claude_tokenizer::{count_tokens, tokenize};
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn StdError>> {
+    // Initialize logging
+    env_logger::init();
+    info!("Starting Sagacity - Elite Terminal Assistant");
 
-// Add a debug macro for easier logging
-macro_rules! debug_print {
-    ($($arg:tt)*) => {
-        eprintln!("[DEBUG] {}", format!($($arg)*));
-    };
-}
+    // Create application instance
+    let mut app = App::new();
 
-// Struct to log API calls
-#[derive(Debug)]
-struct ApiCallLog {
-    timestamp: DateTime<Utc>,
-    endpoint: String,
-    request_summary: String,
-    response_status: u16,
-    response_time_ms: u128,
-}
+    // Load settings
+    load_settings(&mut app)?;
 
-// Struct for indexing cache
-#[derive(Serialize, Deserialize)]
-struct IndexCache {
-    timestamp: u64,
-    last_modification: u64,
-    index: HashMap<String, (String, String)>,
-    file_mod_times: HashMap<String, u64>,
-}
+    // Load chat history
+    load_chat_history(&mut app)?;
 
-// Struct for messages
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Message {
-    role: String,
-    content: String,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    timestamp: DateTime<Utc>,
-}
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-// Struct for conversation sessions
-#[derive(Debug)]
-struct ConversationSession {
-    name: String,
-    index: HashMap<String, (String, String)>,
-    memory: Vec<Message>,
-}
+    // Run the application
+    let res = run_app(&mut terminal, app).await;
 
-// Enum for token categories
-enum TokenCategory {
-    Input,
-    CacheWrite,
-    CacheHit,
-    Output,
-}
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
 
-#[derive(Debug)]
-struct CostRates {
-    input: f64,       // $ per million tokens
-    cache_write: f64, // $ per million tokens
-    cache_hit: f64,   // $ per million tokens
-    output: f64,      // $ per million tokens
-}
-
-impl CostRates {
-    fn get_rates() -> Self {
-        CostRates {
-            input: 3.00,
-            cache_write: 3.75,
-            cache_hit: 0.30,
-            output: 15.00,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Chatbot {
-    index: HashMap<String, (String, String)>,
-    api_key: String,
-    memory: Vec<Message>,
-    sessions: Vec<ConversationSession>,
-    current_session: Option<usize>,
-    api_call_logs: Vec<ApiCallLog>,
-    file_mod_times: HashMap<String, u64>,
-
-    // Token tracking fields
-    input_tokens: usize,
-    cache_write_tokens: usize,
-    cache_hit_tokens: usize,
-    output_tokens: usize,
-
-    // Cost tracking fields
-    input_cost: f64,
-    cache_write_cost: f64,
-    cache_hit_cost: f64,
-    output_cost: f64,
-
-    // Cost rates based on model
-    cost_rates: CostRates,
-    batch_processor: BatchProcessor,
-}
-
-impl Chatbot {
-    fn new(
-        index: HashMap<String, (String, String)>,
-        file_mod_times: HashMap<String, u64>,
-        api_key: String,
-    ) -> Self {
-        Chatbot {
-            index,
-            api_key,
-            memory: Vec::new(),
-            sessions: Vec::new(),
-            current_session: None,
-            api_call_logs: Vec::new(),
-            file_mod_times,
-
-            // Initialize token counts and costs
-            input_tokens: 0,
-            cache_write_tokens: 0,
-            cache_hit_tokens: 0,
-            output_tokens: 0,
-            input_cost: 0.0,
-            cache_write_cost: 0.0,
-            cache_hit_cost: 0.0,
-            output_cost: 0.0,
-            // Initialize cost rates
-            cost_rates: CostRates::get_rates(),
-            // Initialize batch processor
-            batch_processor: BatchProcessor::new(),
-        }
+    if let Err(err) = res {
+        error!("Application error: {:?}", err);
+        eprintln!("Error: {}", err);
     }
 
-    /// Update tokens and calculate costs based on the category
-    fn update_tokens(&mut self, category: TokenCategory, tokens: usize) {
-        match category {
-            TokenCategory::Input => {
-                self.input_tokens += tokens;
-                self.input_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.input;
-            }
-            TokenCategory::CacheWrite => {
-                self.cache_write_tokens += tokens;
-                self.cache_write_cost +=
-                    (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_write;
-            }
-            TokenCategory::CacheHit => {
-                self.cache_hit_tokens += tokens;
-                self.cache_hit_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_hit;
-            }
-            TokenCategory::Output => {
-                self.output_tokens += tokens;
-                self.output_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.output;
-            }
-        }
-    }
+    Ok(())
+}
 
-    /// Calculate total tokens and total cost
-    fn total_tokens(&self) -> usize {
-        self.input_tokens + self.cache_write_tokens + self.cache_hit_tokens + self.output_tokens
-    }
+/// Runs the main loop of the application
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: App,
+) -> Result<(), AppError> {
+    // Setup event channel
+    let (tx, mut rx) = mpsc::channel::<EventType>(100);
 
-    fn total_cost(&self) -> f64 {
-        self.input_cost + self.cache_write_cost + self.cache_hit_cost + self.output_cost
-    }
+    // Clone tx to send to the spawned task
+    let tx_clone = tx.clone();
 
-    async fn process_batch(&mut self, batch: Vec<String>) {
-        // Implement the logic to handle a batch of queries
-        for query in batch {
-            // Process each query as per existing chat logic
-            // For simplicity, we'll call the `chat` function for each
-            // In a real-world scenario, you might optimize this
-            if let Err(e) = self.chat(&query, &ProgressBar::hidden()).await {
-                eprintln!("Error processing query '{}': {}", query, e);
-            }
-        }
-    }
-
-    async fn chat(
-        &mut self,
-        user_query: &str,
-        pb: &ProgressBar,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        debug_print!("Starting chat with system");
-
-        // Step 1: Find relevant files
-        pb.set_message("Generating index relevance scores...");
-        pb.tick();
-        yield_now().await;
-        let index_clone = self.index.clone();
-        let api_key_clone = self.api_key.clone();
-        let relevant_files =
-            search_index(&index_clone, user_query, &api_key_clone, self, pb).await?;
-
-        // Step 2: Extract file paths and languages from relevant_files with proper handling
-        pb.set_message("Extracting file information...");
-        pb.tick();
-        yield_now().await;
-        let relevant_file_info: Vec<(String, String)> = relevant_files
-            .into_iter()
-            .filter_map(|(file, _)| {
-                match self.index.get(&file) {
-                    Some((_, language)) => Some((file.clone(), language.clone())),
-                    None => {
-                        debug_print!("Warning: File '{}' not found in index.", file);
-                        None // Skip files not found in the index
+    // Spawn a task to read user input
+    tokio::spawn(async move {
+        loop {
+            if event::poll(Duration::from_millis(100)).unwrap() {
+                if let Ok(event) = event::read() {
+                    if tx_clone.send(EventType::Crossterm(event)).await.is_err() {
+                        return;
                     }
                 }
-            })
-            .collect();
-
-        // Check if we have any relevant files after filtering
-        if relevant_file_info.is_empty() {
-            pb.set_message("No relevant files found for the query.");
-            pb.tick();
-            yield_now().await;
-            return Err("No relevant files found in the index for the given query.".into());
-        }
-
-        // Step 3: Prepare context for the LLM
-        pb.set_message("Preparing context for AI...");
-        pb.tick();
-        yield_now().await;
-        let context = prepare_context(&relevant_file_info, user_query)?;
-
-        // Tokenize the context and update input tokens
-        let context_tokens = count_tokens(&context)?;
-        self.update_tokens(TokenCategory::Input, context_tokens);
-        debug_print!("Context tokens: {}", context_tokens);
-
-        // Step 4: Generate response using the LLM
-        pb.set_message("Composing final response...");
-        pb.tick();
-        yield_now().await;
-        let api_key_clone = self.api_key.clone();
-        let memory_clone = self.memory.clone();
-        let (response, _) = generate_llm_response(
-            &context,
-            &api_key_clone,
-            &memory_clone,
-            user_query,
-            self,
-            pb,
-        )
-        .await?;
-
-        // Step 5: Update conversation history
-        pb.set_message("Updating conversation history...");
-        pb.tick();
-        yield_now().await;
-        self.memory.push(Message {
-            role: "user".to_string(),
-            content: user_query.to_string(),
-            timestamp: Utc::now(),
-        });
-        self.memory.push(Message {
-            role: "assistant".to_string(),
-            content: response.clone(),
-            timestamp: Utc::now(),
-        });
-
-        Ok(response)
-    }
-}
-
-// Helper struct for rustyline
-struct MyHelper {
-    completer: FilenameCompleter,
-}
-
-impl MyHelper {
-    fn new(completer: FilenameCompleter) -> Self {
-        MyHelper { completer }
-    }
-}
-
-impl Highlighter for MyHelper {}
-impl Validator for MyHelper {}
-impl Hinter for MyHelper {
-    type Hint = String;
-
-    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
-        None
-    }
-}
-
-impl Completer for MyHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        self.completer.complete(line, pos, ctx)
-    }
-}
-
-impl rustyline::Helper for MyHelper {}
-
-// Struct for GitHub repository information
-#[derive(Deserialize)]
-struct GitHubRepo {
-    full_name: String,
-    clone_url: String,
-}
-
-// Updated main function
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    clear_screen();
-    display_welcome_screen();
-
-    // Call the codebase selection menu from the selection module
-    let selected_codebase = codebase_selection_menu().await?;
-    println!("Selected codebase: {:?}", selected_codebase);
-
-    // Select model
-    let models = vec![
-        "Claude 3.5 Sonnet",
-        "Claude 3 Opus",
-        "Claude 3 Sonnet",
-        "Claude 3 Haiku",
-    ];
-    let model_selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select a Claude Model Tier")
-        .default(0)
-        .items(&models)
-        .interact()?;
-
-    let selected_model = models[model_selection];
-    println!("Selected model: {}", selected_model);
-
-    // Proceed with initializing the selected codebase
-    let root_dir = selected_codebase.to_str().unwrap_or(".");
-    let api_key = get_claude_api_key()?;
-    let mut chatbot = initialize_codebase_index(root_dir, &api_key, selected_model).await?;
-
-    let mut rl = Editor::<MyHelper, DefaultHistory>::new()?;
-    rl.set_helper(Some(MyHelper::new(FilenameCompleter::new())));
-
-    // Automatically load conversation history for the default session
-    if let Ok(history) = load_conversation() {
-        chatbot.memory = history;
-        println!("{}", "Conversation history loaded successfully.".green());
-    } else {
-        chatbot.memory = Vec::new();
-    }
-
-    loop {
-        clear_screen();
-        match display_main_menu() {
-            MainMenuOption::Chat => chat_mode(&mut chatbot, &mut rl).await?,
-            MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
-            MainMenuOption::GitHubRecommendations => {
-                github_recommendations::generate_github_recommendations(&mut chatbot).await?
-            }
-            MainMenuOption::Debug => display_api_call_logs(&chatbot),
-            MainMenuOption::Help => display_help(),
-            MainMenuOption::Quit => {
-                display_goodbye_message(&chatbot);
-                break;
             }
         }
-        pause();
-    }
-
-    Ok(())
-}
-
-// Function to clear the terminal screen
-fn clear_screen() {
-    print!("\x1B[2J\x1B[1;1H");
-}
-
-// Function to display the welcome screen
-fn display_welcome_screen() {
-    println!("{}", "Welcome to Codebase Explorer".bold().cyan());
-    println!("{}", "Your intelligent coding companion".italic());
-    println!("\nInitializing...");
-}
-
-// Function to get the Claude API key from .zshrc
-fn get_claude_api_key() -> Result<String, Box<dyn std::error::Error>> {
-    debug_print!("Getting Claude API key");
-    let home_dir = env::var("HOME")?;
-    let zshrc_path = format!("{}/.zshrc", home_dir);
-    debug_print!("Reading .zshrc from: {}", zshrc_path);
-    let zshrc_content =
-        fs::read_to_string(&zshrc_path).map_err(|e| format!("Failed to read .zshrc: {}", e))?;
-
-    for line in zshrc_content.lines() {
-        if line.starts_with("export ANTHROPIC_API_KEY=") {
-            let key = line
-                .split('=')
-                .nth(1)
-                .ok_or("Invalid ANTHROPIC_API_KEY format")?
-                .trim_matches('"')
-                .to_string();
-            debug_print!("API key found");
-            return Ok(key);
-        }
-    }
-
-    Err("ANTHROPIC_API_KEY not found in .zshrc".into())
-}
-
-// Function to scan the codebase for relevant files
-fn scan_codebase(root_dir: &str) -> Vec<String> {
-    let walker = WalkBuilder::new(root_dir)
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(false)
-        .build();
-
-    walker
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
-        .filter(|entry| {
-            let extension = entry.path().extension().and_then(|e| e.to_str());
-            matches!(
-                extension,
-                Some("rs") | Some("toml") | Some("md") | Some("py") | Some("go")
-            )
-        })
-        .map(|entry| entry.path().to_string_lossy().to_string())
-        .collect()
-}
-
-// Function to read file contents
-fn read_file_contents(file_path: &str) -> Result<String, std::io::Error> {
-    fs::read_to_string(file_path)
-}
-async fn summarize_with_claude(
-    content: &str,
-    api_key: &str,
-    language: &str,
-    chatbot: &mut Chatbot,
-) -> Result<String, Box<dyn std::error::Error>> {
-    debug_print!("Summarizing content with Claude");
-    let client = reqwest::Client::new();
-    let prompt = format!(
-        "Provide a very concise summary (2-3 sentences max) of the following {} code, focusing on its main purpose and key functionalities:\n\n{}",
-        language, content
-    );
-
-    // Tokenize the prompt and update input tokens
-    let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
-    debug_print!("Prompt tokens: {}", prompt_tokens);
-
-    let start_time = std::time::Instant::now();
-
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": DEFAULT_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": DEFAULT_MAX_TOKENS
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
-
-    let elapsed_time = start_time.elapsed().as_millis();
-
-    // Log the API call
-    chatbot.api_call_logs.push(ApiCallLog {
-        timestamp: Utc::now(),
-        endpoint: CLAUDE_API_URL.to_string(),
-        request_summary: "summarize_with_claude".to_string(),
-        response_status: response.status().as_u16(),
-        response_time_ms: elapsed_time,
     });
 
-    debug_print!("Response status: {}", response.status());
+    // Main loop
+    loop {
+        terminal.draw(|f| ui(f, &app))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response body: {}", e))?;
-        debug_print!("Error response body: {}", error_body);
-        return Err(format!("Claude API request failed: {} - {}", status, error_body).into());
+        tokio::select! {
+            Some(event) = rx.recv() => {
+                match event {
+                    EventType::Crossterm(crossterm_event) => {
+                        let should_quit = handle_event(crossterm_event, &mut app, &tx).await?;
+                        if should_quit {
+                            break;
+                        }
+                    }
+                    EventType::MockAIResponse(response) => {
+                        // Update the last message's assistant response
+                        if let Some(last) = app.messages.last_mut() {
+                            last.assistant = response;
+                        }
+                    }
+                    EventType::MockAIError(error_msg) => {
+                        if let Some(last) = app.messages.last_mut() {
+                            last.assistant = format!("Error: {}", error_msg);
+                        }
+                        app.notification = Some((format!("AI Error: {}", error_msg), Color::Red));
+                    }
+                }
+            }
+            _ = time::sleep(Duration::from_millis(50)) => {
+                // Handle periodic tasks if necessary
+            }
+        }
+
+        if let AppState::Quit = app.state {
+            break;
+        }
     }
 
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+    // Save chat history before exiting
+    save_chat_history(&app)?;
 
-    debug_print!(
-        "Response body: {}",
-        serde_json::to_string_pretty(&body).unwrap()
-    );
-
-    let summary = body["content"][0]["text"]
-        .as_str()
-        .ok_or("Missing 'text' field in API response")?
-        .trim()
-        .to_string();
-
-    if summary.is_empty() {
-        return Err("Empty summary received from Claude API".into());
-    }
-
-    debug_print!("Received summary: {}", summary);
-
-    // Tokenize the response and update output tokens
-    let response_tokens = count_tokens(&summary)?;
-    chatbot.update_tokens(TokenCategory::Output, response_tokens);
-    debug_print!("Response tokens: {}", response_tokens);
-
-    Ok(summary)
-}
-
-// Function to load index cache
-fn load_index_cache() -> Result<Option<IndexCache>, Box<dyn std::error::Error>> {
-    if let Ok(contents) = fs::read_to_string("index_cache.json") {
-        let cache: IndexCache = serde_json::from_str(&contents)?;
-        debug_print!("Index cache loaded successfully.");
-        Ok(Some(cache))
-    } else {
-        debug_print!("No existing index cache found.");
-        Ok(None)
-    }
-}
-
-// Function to save index cache
-fn save_index_cache(
-    index: &HashMap<String, (String, String)>,
-    last_modification: u64,
-    file_mod_times: &HashMap<String, u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = IndexCache {
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        last_modification,
-        index: index.clone(),
-        file_mod_times: file_mod_times.clone(),
-    };
-    let serialized = serde_json::to_string_pretty(&cache)?;
-    fs::write("index_cache.json", serialized)?;
-    debug_print!("Index cache saved successfully.");
     Ok(())
 }
 
-// Function to index the codebase
-async fn index_codebase(
-    root_dir: &str,
-    api_key: &str,
-    pb: &ProgressBar,
-    chatbot: &mut Chatbot,
-) -> Result<
-    (HashMap<String, (String, String)>, u64, HashMap<String, u64>),
-    Box<dyn std::error::Error>,
-> {
-    let mut index = chatbot.index.clone();
-    let mut file_mod_times = chatbot.file_mod_times.clone();
+/// Handles incoming events and updates the application state
+async fn handle_event(
+    event: CEvent,
+    app: &mut App,
+    tx: &mpsc::Sender<EventType>,
+) -> Result<bool, AppError> {
+    match app.state {
+        AppState::MainMenu => match event {
+            CEvent::Key(key) => match key.code {
+                KeyCode::Up => {
+                    if app.selected_menu_item > 0 {
+                        app.selected_menu_item -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if app.selected_menu_item < menu_items().len() - 1 {
+                        app.selected_menu_item += 1;
+                    }
+                }
+                KeyCode::Enter => match app.selected_menu_item {
+                    0 => app.state = AppState::Chat,
+                    1 => app.state = AppState::BrowseIndex,
+                    2 => app.state = AppState::GitHubRecommendations,
+                    3 => app.state = AppState::Help,
+                    4 => app.state = AppState::Settings,
+                    5 => app.state = AppState::QuitConfirm,
+                    _ => {}
+                },
+                KeyCode::Char('q') | KeyCode::Esc => app.state = AppState::QuitConfirm,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.state = AppState::QuitConfirm
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.state = AppState::Help
+                }
+                _ => {}
+            },
+            _ => {}
+        },
+        AppState::Chat => match event {
+            CEvent::Key(key) => match key.code {
+                KeyCode::Char(c) => app.input.push(c),
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                KeyCode::Enter => {
+                    let user_message = app.input.drain(..).collect::<String>();
+                    if !user_message.is_empty() {
+                        // Push user message with a placeholder for assistant response
+                        app.messages.push(ChatMessage {
+                            user: user_message.clone(),
+                            assistant: "Thinking...".to_string(),
+                        });
 
-    let walker = WalkBuilder::new(root_dir)
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(false)
-        .build();
+                        // Mock AI response instead of actual API call
+                        let mock_response = format!("Echo: {}", user_message);
+                        if tx
+                            .send(EventType::MockAIResponse(mock_response))
+                            .await
+                            .is_err()
+                        {
+                            error!("Failed to send AI response");
+                        }
+                    }
+                }
+                KeyCode::Esc => app.state = AppState::MainMenu,
+                _ => {}
+            },
+            _ => {}
+        },
+        AppState::BrowseIndex => {
+            // Placeholder for Browse Index functionality
+            if let CEvent::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    app.state = AppState::MainMenu;
+                }
+            }
+        }
+        AppState::GitHubRecommendations => {
+            // Placeholder for GitHub Recommendations functionality
+            if let CEvent::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    app.state = AppState::MainMenu;
+                }
+            }
+        }
+        AppState::Help => {
+            if let CEvent::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    app.state = AppState::MainMenu;
+                }
+            }
+        }
+        AppState::Settings => match event {
+            CEvent::Key(key) => match key.code {
+                KeyCode::Esc => app.state = AppState::MainMenu,
+                KeyCode::Char('t') => {
+                    // Toggle theme
+                    app.settings.theme = match app.settings.theme {
+                        Theme::Light => Theme::Dark,
+                        Theme::Dark => Theme::Light,
+                    };
+                    app.notification = Some((
+                        format!(
+                            "Theme changed to {}",
+                            match app.settings.theme {
+                                Theme::Light => "Light",
+                                Theme::Dark => "Dark",
+                            }
+                        ),
+                        Color::Green,
+                    ));
+                    // Save settings
+                    if let Err(e) = save_settings(app) {
+                        app.notification =
+                            Some((format!("Failed to save settings: {}", e), Color::Red));
+                        error!("Failed to save settings: {:?}", e);
+                    }
+                }
+                KeyCode::Char('k') => {
+                    // Simulate updating the API key
+                    app.settings.ai_api_key = "mock_api_key".to_string();
+                    app.notification =
+                        Some(("API Key updated successfully.".to_string(), Color::Green));
+                    // Save settings
+                    if let Err(e) = save_settings(app) {
+                        app.notification =
+                            Some((format!("Failed to save settings: {}", e), Color::Red));
+                        error!("Failed to save settings: {:?}", e);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        },
+        AppState::QuitConfirm => match event {
+            CEvent::Key(key) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => return Ok(true),
+                KeyCode::Char('n') | KeyCode::Esc => app.state = AppState::MainMenu,
+                _ => {}
+            },
+            _ => {}
+        },
+        AppState::Quit => {}
+    }
 
-    let files: Vec<String> = walker
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
-        .filter(|entry| {
-            let extension = entry.path().extension().and_then(|e| e.to_str());
-            matches!(
-                extension,
-                Some("rs") | Some("toml") | Some("md") | Some("py") | Some("go")
-            )
+    Ok(false)
+}
+
+/// Returns the main menu items with associated icons
+fn menu_items() -> Vec<&'static str> {
+    vec![
+        "💬 Chat",
+        "📂 Browse Index",
+        "🔍 GitHub Recommendations",
+        "❓ Help",
+        "⚙️ Settings",
+        "🚪 Quit",
+    ]
+}
+
+/// Draws the user interface based on the current application state
+fn ui(f: &mut Frame<'_>, app: &App) {
+    // Define the overall layout with header, body, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(7), // Header
+                Constraint::Min(1),    // Body
+                Constraint::Length(3), // Footer
+            ]
+            .as_ref(),
+        )
+        .split(f.area());
+
+    // Draw header
+    draw_header(f, chunks[0], app);
+
+    // Draw body based on state
+    match app.state {
+        AppState::MainMenu => draw_main_menu(f, chunks[1], app),
+        AppState::Chat => draw_chat(f, chunks[1], app),
+        AppState::BrowseIndex => draw_placeholder(f, chunks[1], "Browse Index"),
+        AppState::GitHubRecommendations => draw_placeholder(f, chunks[1], "GitHub Recommendations"),
+        AppState::Help => draw_help(f, chunks[1], app),
+        AppState::Settings => draw_settings(f, chunks[1], app),
+        AppState::QuitConfirm => draw_quit_confirm(f, chunks[1], app),
+        AppState::Quit => {} // No need to draw anything; main loop will exit
+    }
+
+    // Draw footer
+    draw_footer(f, chunks[2], app);
+
+    // Draw notification if present
+    draw_notification(f, app);
+}
+
+/// Draws the header with ASCII art and application title
+fn draw_header(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // ASCII Art Logo
+    let logo = r#"
+     _____                 _
+    / ____|               | |
+   | (___  _   _ _ __ ___ | |__   ___
+    \___ \| | | | '_ ` _ \| '_ \ / _ \
+    ____) | |_| | | | | | | |_) | (_) |
+   |_____/ \__,_|_| |_| |_|_.__/ \___/
+    "#;
+
+    // Create a block for the header background
+    let block = Block::default()
+        .style(
+            get_theme_style(app.settings.theme)
+                .fg(Color::LightCyan)
+                .bg(Color::Black),
+        )
+        .borders(Borders::NONE);
+
+    f.render_widget(block, area);
+
+    // Split the header area into two parts: logo and title
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(area);
+
+    // Render the logo
+    let logo_paragraph = Paragraph::new(logo)
+        .style(
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(logo_paragraph, chunks[0]);
+
+    // Render the title
+    let title = Paragraph::new("Sagacity - Elite Terminal Assistant")
+        .style(
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        )
+        .alignment(Alignment::Center);
+
+    f.render_widget(title, chunks[1]);
+}
+
+/// Draws the footer with dynamic instructions
+fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let instructions = match app.state {
+        AppState::MainMenu => {
+            "Use Up/Down arrows to navigate, Enter to select, 'q' or Esc to quit."
+        }
+        AppState::Chat => "Type your message and press Enter to send. Esc to return to main menu.",
+        AppState::BrowseIndex => "Press Esc to return to main menu.",
+        AppState::GitHubRecommendations => "Press Esc to return to main menu.",
+        AppState::Help => "Press Esc to return to main menu.",
+        AppState::Settings => "Press 't' to toggle theme, 'k' to update API key, Esc to return.",
+        AppState::QuitConfirm => "Press 'y' to confirm quit or 'n' to cancel.",
+        AppState::Quit => "",
+    };
+
+    let footer = Paragraph::new(instructions)
+        .style(Style::default().fg(Color::LightCyan))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(footer, area);
+}
+
+/// Draws the main menu with selectable items and icons
+fn draw_main_menu(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Create a block for the menu background
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Main Menu")
+        .style(
+            get_theme_style(app.settings.theme)
+                .fg(Color::LightYellow)
+                .bg(Color::Black),
+        );
+
+    f.render_widget(block, area);
+
+    // Create menu items with icons
+    let items: Vec<ListItem> = menu_items()
+        .iter()
+        .enumerate()
+        .map(|(i, &item)| {
+            let content = if i == app.selected_menu_item {
+                // Highlight selected item
+                ListItem::new(item).style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ListItem::new(item).style(Style::default().fg(Color::White))
+            };
+            content
         })
-        .map(|entry| entry.path().to_string_lossy().to_string())
         .collect();
 
-    pb.set_length(files.len() as u64);
+    let list = List::new(items)
+        .block(Block::default())
+        .highlight_style(Style::default().bg(Color::LightMagenta).fg(Color::Black))
+        .highlight_symbol("➤ ");
 
-    let mut last_modification = 0;
-    let mut files_set = HashSet::new();
+    // Calculate the layout for the list
+    let list_area = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([Constraint::Min(1)].as_ref())
+        .split(area)[0];
 
-    for (i, file_path) in files.iter().enumerate() {
-        pb.set_message(format!(
-            "Processing file {}/{}: {}",
-            i + 1,
-            files.len(),
-            file_path
-        ));
+    f.render_widget(list, list_area);
+}
 
-        // Get the last modification time of the file
-        let metadata = fs::metadata(&file_path)?;
-        let modified = metadata.modified()?;
-        let modified_secs = modified.duration_since(UNIX_EPOCH)?.as_secs();
-        last_modification = std::cmp::max(last_modification, modified_secs);
+/// Draws the chat interface with enhanced styling
+fn draw_chat(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Create a block for the chat background
+    let block = Block::default().borders(Borders::ALL).title("Chat").style(
+        get_theme_style(app.settings.theme)
+            .fg(Color::LightYellow)
+            .bg(Color::Black),
+    );
 
-        files_set.insert(file_path.clone());
+    f.render_widget(block, area);
 
-        // Check if the file has been modified since last indexing
-        let needs_reindex = match file_mod_times.get(file_path) {
-            Some(&cached_mod_time) => modified_secs > cached_mod_time,
-            None => true, // New file
+    // Split chat area into message view and input
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(
+            [
+                Constraint::Min(1),    // Messages
+                Constraint::Length(3), // Input
+            ]
+            .as_ref(),
+        )
+        .split(area);
+
+    // Render messages with distinct styles
+    let messages: Vec<ListItem> = app
+        .messages
+        .iter()
+        .map(|msg| {
+            let content = format!("💬 You: {}\n🤖 AI: {}", msg.user, msg.assistant);
+            ListItem::new(content).style(Style::default().fg(Color::White))
+        })
+        .collect();
+
+    let messages_list = List::new(messages)
+        .block(Block::default())
+        .style(Style::default())
+        .highlight_style(Style::default())
+        .highlight_symbol("");
+
+    f.render_widget(messages_list, chunks[0]);
+
+    // Render input box with blinking cursor simulation
+    let input = Paragraph::new(app.input.as_str())
+        .style(Style::default().fg(Color::LightYellow))
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .alignment(Alignment::Left);
+
+    f.render_widget(input, chunks[1]);
+
+    // Set cursor position
+    let x = chunks[1].x + app.input.len() as u16 + 1;
+    let y = chunks[1].y + 1;
+    f.set_cursor_position((x, y));
+}
+
+/// Draws placeholder screens for Browse Index and GitHub Recommendations with enhanced styling
+fn draw_placeholder(f: &mut Frame<'_>, area: Rect, title: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(Color::LightYellow).bg(Color::Black));
+
+    f.render_widget(block, area);
+
+    let placeholder_text = format!(
+        "{} functionality is under construction.\n\nPress 'Esc' to return to the main menu.",
+        title
+    );
+
+    let paragraph = Paragraph::new(placeholder_text)
+        .style(Style::default().fg(Color::White))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
+/// Draws the help screen with improved formatting and styling
+fn draw_help(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Create a block for the help background
+    let block = Block::default().borders(Borders::ALL).title("Help").style(
+        get_theme_style(app.settings.theme)
+            .fg(Color::LightYellow)
+            .bg(Color::Black),
+    );
+
+    f.render_widget(block, area);
+
+    // Define help text with clear formatting
+    let help_text = "\
+📚 **Navigation:**
+ - Use **Up/Down arrows** to navigate the main menu.
+ - Press **Enter** to select an option.
+ - In **Chat**, type your message and press **Enter** to send.
+ - Press **Esc** to return to the main menu from any screen.
+
+💡 **Tips:**
+ - Be clear and concise in your messages for better responses.
+ - Explore different features as they become available.
+
+Press **Esc** to return to the main menu.";
+
+    let paragraph = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::White))
+        .block(Block::default())
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
+/// Draws the settings screen with options to change theme and update API key
+fn draw_settings(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Create a block for the settings background
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Settings")
+        .style(
+            get_theme_style(app.settings.theme)
+                .fg(Color::LightYellow)
+                .bg(Color::Black),
+        );
+
+    f.render_widget(block, area);
+
+    // Define settings text
+    let settings_text = format!(
+        "🔑 **API Key:** {}\n🎨 **Theme:** {:?}\n\nOptions:\n - Press 't' to toggle theme.\n - Press 'k' to update API key.\n\nPress **Esc** to return to main menu.",
+        if app.settings.ai_api_key.is_empty() {
+            "Not Set".to_string()
+        } else {
+            "******".to_string()
+        },
+        app.settings.theme
+    );
+
+    let paragraph = Paragraph::new(settings_text)
+        .style(Style::default().fg(Color::White))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
+/// Draws the quit confirmation screen with interactive options and enhanced styling
+fn draw_quit_confirm(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Confirm Quit")
+        .style(
+            get_theme_style(app.settings.theme)
+                .fg(Color::LightYellow)
+                .bg(Color::Black),
+        );
+
+    f.render_widget(block, area);
+
+    // Define confirmation text
+    let quit_text = "🚪 **Are you sure you want to quit?**\n\nPress **'y'** to confirm quit or **'n'** to cancel.";
+
+    let paragraph = Paragraph::new(quit_text)
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
+/// Draws a notification message if present
+fn draw_notification(f: &mut Frame<'_>, app: &App) {
+    if let Some((msg, color)) = &app.notification {
+        let size = f.area(); // Updated from f.size() to f.area()
+        let block = Block::default()
+            .style(Style::default().fg(*color).bg(Color::Black))
+            .borders(Borders::ALL)
+            .title("Notification");
+
+        let paragraph = Paragraph::new(msg.clone())
+            .style(Style::default().fg(*color))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+
+        let area = Rect {
+            x: size.x + 2,
+            y: size.y + 2,
+            width: size.width - 4,
+            height: 5,
         };
 
-        if needs_reindex {
-            debug_print!("Re-indexing file: {}", file_path);
-            let content = read_file_contents(&file_path)
-                .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
-
-            let language = detect_language(&file_path);
-            let summary = match summarize_with_claude(&content, api_key, &language, chatbot).await {
-                Ok(summary) => summary,
-                Err(e) => {
-                    debug_print!("Error summarizing {}: {}", file_path, e);
-                    format!(
-                        "Failed to summarize. File content preview: {}",
-                        &content[..std::cmp::min(content.len(), 100)]
-                    )
-                }
-            };
-
-            index.insert(file_path.clone(), (summary, language));
-            file_mod_times.insert(file_path.clone(), modified_secs); // Update modification time
-        } else {
-            debug_print!("Skipping file (no changes): {}", file_path);
-            // Update cache hit tokens if applicable
-            // Assuming cache_hit_tokens are updated elsewhere if needed
-        }
-
-        pb.inc(1);
+        f.render_widget(block, area);
+        f.render_widget(paragraph, area);
     }
-
-    // Remove entries for files that no longer exist
-    index.retain(|file_path, _| files_set.contains(file_path));
-    file_mod_times.retain(|file_path, _| files_set.contains(file_path));
-
-    pb.finish_with_message(format!(
-        "Indexing complete. Total files indexed: {}",
-        index.len()
-    ));
-
-    // Save the index cache
-    save_index_cache(&index, last_modification, &file_mod_times)?;
-
-    Ok((index, last_modification, file_mod_times))
 }
 
-// Function to detect programming language based on file extension
-fn detect_language(file_path: &str) -> String {
-    let extension = std::path::Path::new(file_path)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("");
-
-    match extension {
-        "rs" => "rust",
-        "py" => "python",
-        "go" => "go",
-        "ts" => "typescript",
-        "js" => "javascript",
-        "java" => "java",
-        "c" => "c",
-        "cpp" => "cpp",
-        _ => "unknown",
+/// Returns the style based on the current theme
+fn get_theme_style(theme: Theme) -> Style {
+    match theme {
+        Theme::Light => Style::default().bg(Color::White).fg(Color::Black),
+        Theme::Dark => Style::default().bg(Color::Black).fg(Color::White),
     }
-    .to_string()
 }
 
-// Function to search the index based on a query
-async fn search_index(
-    index: &HashMap<String, (String, String)>,
-    query: &str,
-    api_key: &str,
-    chatbot: &mut Chatbot,
-    pb: &ProgressBar, // Added ProgressBar parameter
-) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
-    pb.set_message("Searching index...");
-    pb.tick();
-    yield_now().await;
-
-    let mut prompt = format!(
-        "Based on the following query, score the relevance of each summary on a scale of 0 to 1:\n\nQuery: {}\n\n",
-        query
-    );
-
-    for (file, (summary, _)) in index {
-        prompt.push_str(&format!("Summary for {}: {}\n\n", file, summary));
+/// Loads settings from a JSON file or environment variables
+fn load_settings(app: &mut App) -> Result<(), AppError> {
+    // Attempt to load settings from a file
+    if let Ok(data) = fs::read_to_string("settings.json") {
+        let settings: Settings = serde_json::from_str(&data)?;
+        app.settings = settings;
+        info!("Settings loaded from file.");
+    } else {
+        // If file doesn't exist, load from environment variables
+        let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+        app.settings.ai_api_key = api_key;
+        app.settings.theme = Theme::Light;
+        info!("Settings loaded from environment variables.");
     }
 
-    prompt.push_str(
-        "Provide your response in the following format:\n\n<file_path_1>,<relevance_score_1>\n<file_path_2>,<relevance_score_2>\n...\n",
-    );
-
-    // Tokenize the prompt and update input tokens
-    let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
-    debug_print!("Search index prompt tokens: {}", prompt_tokens);
-
-    pb.set_message("Sending request to Claude API for relevance scoring...");
-    pb.tick();
-    yield_now().await;
-
-    let client = reqwest::Client::new();
-    let start_time = std::time::Instant::now();
-
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": DEFAULT_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": DEFAULT_MAX_TOKENS
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
-
-    let elapsed_time = start_time.elapsed().as_millis();
-
-    // Log the API call
-    chatbot.api_call_logs.push(ApiCallLog {
-        timestamp: Utc::now(),
-        endpoint: CLAUDE_API_URL.to_string(),
-        request_summary: "search_index".to_string(),
-        response_status: response.status().as_u16(),
-        response_time_ms: elapsed_time,
-    });
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response body: {}", e))?;
-        debug_print!("Error response body: {}", error_body);
-        pb.set_message("Failed to score relevance with Claude API.");
-        pb.tick();
-        yield_now().await;
-        return Err(format!("Claude API request failed: {} - {}", status, error_body).into());
-    }
-
-    let body: Value = response.json().await?;
-    let response_text = body["content"][0]["text"]
-        .as_str()
-        .ok_or("Missing 'text' field in API response")?
-        .trim()
-        .to_string();
-
-    let mut relevant_files = Vec::new();
-    for line in response_text.lines() {
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() == 2 {
-            let file = parts[0].to_string();
-            let relevance: f32 = parts[1].parse().unwrap_or(0.0);
-            relevant_files.push((file, relevance));
-        }
-    }
-
-    relevant_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    relevant_files.truncate(5); // Limit to top 5 most relevant files
-
-    pb.set_message("Relevance scoring completed.");
-    pb.tick();
-    yield_now().await;
-
-    // Tokenize the response and update output tokens
-    let response_tokens = count_tokens(&response_text)?;
-    chatbot.update_tokens(TokenCategory::Output, response_tokens);
-    debug_print!("Relevance scoring response tokens: {}", response_tokens);
-
-    Ok(relevant_files)
+    Ok(())
 }
 
-// Function to initialize the codebase index
-async fn initialize_codebase_index(
-    root_dir: &str,
-    api_key: &str,
-    model: &str, // Add model parameter
-) -> Result<Chatbot, Box<dyn std::error::Error>> {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Indexing codebase...");
-
-    let cache = load_index_cache()?;
-    let index = cache.as_ref().map(|c| c.index.clone()).unwrap_or_default();
-    let file_mod_times = cache
-        .as_ref()
-        .map(|c| c.file_mod_times.clone())
-        .unwrap_or_default();
-
-    let mut chatbot = Chatbot::new(index, file_mod_times, api_key.to_string());
-
-    let (_new_index, _last_modification, updated_file_mod_times) =
-        index_codebase(root_dir, api_key, &pb, &mut chatbot).await?;
-
-    pb.finish_with_message("Indexing completed");
-
-    // Update chatbot's index and file_mod_times with new data
-    chatbot.index = _new_index;
-    chatbot.file_mod_times = updated_file_mod_times;
-
-    Ok(chatbot)
+/// Saves settings to a JSON file
+fn save_settings(app: &App) -> Result<(), AppError> {
+    let data = serde_json::to_string_pretty(&app.settings)?;
+    fs::write("settings.json", data)?;
+    info!("Settings saved to file.");
+    Ok(())
 }
 
-// Enum for main menu options
-enum MainMenuOption {
+/// Loads chat history from a JSON file
+fn load_chat_history(app: &mut App) -> Result<(), AppError> {
+    if let Ok(data) = fs::read_to_string("chat_history.json") {
+        let chat_history: Vec<ChatMessage> = serde_json::from_str(&data)?;
+        app.messages = chat_history;
+        info!("Chat history loaded from file.");
+    }
+    Ok(())
+}
+
+/// Saves chat history to a JSON file
+fn save_chat_history(app: &App) -> Result<(), AppError> {
+    let chat_history = &app.messages;
+    let data = serde_json::to_string_pretty(chat_history)?;
+    fs::write("chat_history.json", data)?;
+    info!("Chat history saved to file.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mock_response() {
+        let input = "Hello, AI!";
+        let expected = "Echo: Hello, AI!";
+        let mock_response = format!("Echo: {}", input);
+        assert_eq!(mock_response, expected);
+    }
+
+    // Add more tests for different components
+}
+
+/// Placeholder function for simulating assistant response
+/// This function replaces the actual AI integration
+fn mock_ai_response(user_message: &str) -> String {
+    format!("Echo: {}", user_message)
+}
+
+/// Define custom events that include both CEvent and Mock AI responses
+enum EventType {
+    Crossterm(CEvent),
+    MockAIResponse(String),
+    MockAIError(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppState {
+    MainMenu,
     Chat,
     BrowseIndex,
-    GitHubRecommendations, // New option
-    Debug,
+    GitHubRecommendations,
     Help,
+    Settings,
+    QuitConfirm,
     Quit,
 }
 
-// Function to display the main menu
-fn display_main_menu() -> MainMenuOption {
-    let choices = vec![
-        "Chat with AI",
-        "Browse Index",
-        "GitHub Recommendations", // New option
-        "Debug Mode",
-        "Help",
-        "Quit",
-    ];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("What would you like to do?")
-        .default(0)
-        .items(&choices)
-        .interact()
-        .unwrap();
-
-    match selection {
-        0 => MainMenuOption::Chat,
-        1 => MainMenuOption::BrowseIndex,
-        2 => MainMenuOption::GitHubRecommendations, // Match the new option
-        3 => MainMenuOption::Debug,
-        4 => MainMenuOption::Help,
-        5 => MainMenuOption::Quit,
-        _ => unreachable!(),
-    }
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatMessage {
+    user: String,
+    assistant: String,
 }
 
-// Function to pause and wait for user input
-fn pause() {
-    println!("\nPress Enter to continue...");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+#[derive(Debug, Serialize, Deserialize)]
+struct Settings {
+    ai_api_key: String,
+    theme: Theme,
 }
 
-fn display_goodbye_message(chatbot: &Chatbot) {
-    clear_screen();
-    println!("{}", "Thank you for using Codebase Explorer".bold().green());
-    println!("Have a great day!");
-    println!();
-    println!("{}", "---- Token Usage Summary ----".bold().underline());
-    println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
-    println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
-    println!(
-        "{}: {} tokens",
-        "Cache Write Tokens", chatbot.cache_write_tokens
-    );
-    println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
-    println!(
-        "{}: {} tokens",
-        "Cache Hit Tokens", chatbot.cache_hit_tokens
-    );
-    println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
-    println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
-    println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
-    println!();
-    println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
-    println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
-    println!("{}", "------------------------------".bold().underline());
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+enum Theme {
+    Light,
+    Dark,
 }
 
-// Function to handle response actions (copy to clipboard, save to file, continue)
-async fn handle_response_actions_simple(
-    response: &str,
-    api_key: &str,
-    chatbot: &mut Chatbot,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let action = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("What would you like to do with the response?")
-        .default(0)
-        .items(&["Copy to clipboard", "Save to file", "Continue"])
-        .interact()?;
-
-    match action {
-        0 => copy_to_clipboard(response)?,
-        1 => save_to_file(response, api_key, chatbot).await?,
-        2 => {}
-        _ => unreachable!(),
-    }
-    Ok(())
+struct App {
+    state: AppState,
+    messages: Vec<ChatMessage>,
+    input: String,
+    tick_rate: Duration,
+    selected_menu_item: usize,
+    notification: Option<(String, Color)>,
+    settings: Settings,
+    last_tick: Instant,
 }
 
-async fn chat_mode(
-    chatbot: &mut Chatbot,
-    rl: &mut Editor<MyHelper, DefaultHistory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Automatically load conversation history at the start of chat mode
-    if let Ok(history) = load_conversation() {
-        chatbot.memory = history;
-        println!("{}", "Conversation history loaded successfully.".green());
-    } else {
-        chatbot.memory = Vec::new();
-    }
-
-    loop {
-        clear_screen();
-        match display_main_menu() {
-            MainMenuOption::Chat => {
-                print_header("Chat with AI");
-                display_chat_history(chatbot);
-
-                let chat_query = rl.readline(&format!(
-                    "{} ",
-                    "Enter your question (or type '/help' for commands):"
-                        .bold()
-                        .cyan()
-                ))?;
-                let chat_query = chat_query.trim();
-
-                match chat_query {
-                    "/exit" => break,
-                    "/clear" => {
-                        chatbot.memory.clear();
-                        println!("{}", "Conversation history cleared.".bold().green());
-                        save_conversation(&chatbot.memory)?;
-                        continue;
-                    }
-                    "/help" => {
-                        display_chat_help();
-                        pause();
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                // Create a ProgressBar with custom style
-                let pb = ProgressBar::new_spinner();
-                pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.cyan} {msg}")
-                        .unwrap(),
-                );
-
-                // Initialize ProgressBar with the first message
-                pb.set_message("Initializing chat session...");
-                pb.enable_steady_tick(std::time::Duration::from_millis(120));
-
-                // Pass the ProgressBar to the chat function
-                let response = chatbot.chat(chat_query, &pb).await?;
-
-                pb.finish_and_clear();
-
-                chatbot.memory.push(Message {
-                    role: "user".to_string(),
-                    content: chat_query.to_string(),
-                    timestamp: Utc::now(),
-                });
-                chatbot.memory.push(Message {
-                    role: "assistant".to_string(),
-                    content: response.clone(),
-                    timestamp: Utc::now(),
-                });
-
-                // Automatically save conversation history after each response
-                save_conversation(&chatbot.memory)?;
-
-                display_ai_response(&response);
-
-                // Display token count and cost
-                println!("{}", "---- Token Usage ----".bold().underline());
-                println!("{}: {} tokens", "Input Tokens", chatbot.input_tokens);
-                println!("{}: ${:.2}", "Input Cost", chatbot.input_cost);
-                println!(
-                    "{}: {} tokens",
-                    "Cache Write Tokens", chatbot.cache_write_tokens
-                );
-                println!("{}: ${:.2}", "Cache Write Cost", chatbot.cache_write_cost);
-                println!(
-                    "{}: {} tokens",
-                    "Cache Hit Tokens", chatbot.cache_hit_tokens
-                );
-                println!("{}: ${:.2}", "Cache Hit Cost", chatbot.cache_hit_cost);
-                println!("{}: {} tokens", "Output Tokens", chatbot.output_tokens);
-                println!("{}: ${:.2}", "Output Cost", chatbot.output_cost);
-                println!("{}: {} tokens", "Total Tokens", chatbot.total_tokens());
-                println!("{}: ${:.2}", "Total Cost", chatbot.total_cost());
-                println!("{}", "----------------------".bold().underline());
-                println!();
-
-                // Handle response actions without diff-related options
-                let api_key_clone = chatbot.api_key.clone();
-                handle_response_actions_simple(&response, &api_key_clone, chatbot).await?;
-            }
-            MainMenuOption::BrowseIndex => browse_index(&chatbot.index),
-            MainMenuOption::GitHubRecommendations => {
-                github_recommendations::generate_github_recommendations(chatbot).await?
-            }
-            MainMenuOption::Debug => display_api_call_logs(&chatbot),
-            MainMenuOption::Help => display_help(),
-            MainMenuOption::Quit => {
-                display_goodbye_message(&chatbot);
-                break;
-            }
-        }
-        pause();
-    }
-    Ok(())
-}
-
-// Function to display chat history
-fn display_chat_history(chatbot: &Chatbot) {
-    for message in chatbot.memory.iter().rev().take(5).rev() {
-        let role = if message.role == "user" { "You" } else { "AI" };
-        let color = if message.role == "user" {
-            "blue"
-        } else {
-            "green"
-        };
-        println!("{}: {}", role.bold().color(color), message.content);
-        println!();
-    }
-}
-
-// Function to display chat help
-fn display_chat_help() {
-    clear_screen();
-    print_header("Chat Commands");
-    println!("{:<15} {}", "/exit".bold(), "Return to main menu");
-    println!("{:<15} {}", "/clear".bold(), "Clear conversation history");
-    println!("{:<15} {}", "/help".bold(), "Display this help message");
-    println!("{:<15} {}", "/save".bold(), "Save the current conversation");
-    println!(
-        "{:<15} {}",
-        "/load".bold(),
-        "Load a previously saved conversation"
-    );
-}
-
-// Function to display AI response
-fn display_ai_response(response: &str) {
-    println!("{}", "AI Response:".bold().green());
-    for line in textwrap::wrap(response, 80) {
-        println!("  {}", line);
-    }
-    println!();
-}
-
-// Function to display help menu
-fn display_help() {
-    print_header("Help Menu");
-    println!("{}", "Available Commands:".bold().yellow());
-    println!("  {} {}", "/exit:".bold(), "End the chat session");
-    println!(
-        "  {} {}",
-        "/clear:".bold(),
-        "Clear the conversation history"
-    );
-    println!("  {} {}", "/help:".bold(), "Display this help message");
-    println!("  {} {}", "/save:".bold(), "Save the current conversation");
-    println!(
-        "  {} {}",
-        "/load:".bold(),
-        "Load a previously saved conversation"
-    );
-    println!("  {} {}", "/last:".bold(), "Display your last message");
-    println!("\n{}", "Chat Instructions:".bold().yellow());
-    println!("  Type your questions normally to chat with the AI about the codebase.");
-    println!("  The AI will provide information based on the indexed files and your queries.");
-    println!("\n{}", "Navigation:".bold().yellow());
-    println!("  Use the arrow keys to navigate through previous commands.");
-    println!("  Press Enter to submit your query or command.");
-    println!("\n{}", "Tips:".bold().yellow());
-    println!("  - Be specific in your questions to get more accurate responses.");
-    println!("  - Use '/save' regularly to keep a backup of your conversation.");
-    println!("  - If you're lost, use '/clear' to start a fresh conversation.");
-    println!("  - Use '/last' to review your most recent message.");
-    println!();
-}
-
-// Function to save conversation history
-fn save_conversation(conversation_history: &[Message]) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(conversation_history)?;
-    fs::write("conversation_history.json", json)?;
-    println!("Conversation saved successfully.");
-    Ok(())
-}
-
-// Function to load conversation history
-fn load_conversation() -> std::io::Result<Vec<Message>> {
-    let json = fs::read_to_string("conversation_history.json")?;
-    let conversation_history: Vec<Message> = serde_json::from_str(&json)?;
-    println!("Conversation loaded successfully.");
-    Ok(conversation_history)
-}
-
-// Function to copy text to clipboard
-fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ctx: ClipboardContext = ClipboardProvider::new()?;
-    ctx.set_contents(text.to_owned())?;
-    println!("Output copied to clipboard.");
-    Ok(())
-}
-
-// Function to save text to a file
-async fn save_to_file(
-    text: &str,
-    api_key: &str,
-    chatbot: &mut Chatbot,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let filename = generate_organized_filename(api_key, text, chatbot).await?;
-    let output_dir = "ai_responses";
-    fs::create_dir_all(output_dir)?;
-    let file_path = format!("{}/{}", output_dir, filename);
-    let mut file = File::create(&file_path)?;
-    file.write_all(text.as_bytes())?;
-    println!("Output saved to file: {}", file_path);
-    Ok(())
-}
-
-// Function to generate an organized filename using Claude API
-async fn generate_organized_filename(
-    api_key: &str,
-    content: &str,
-    chatbot: &mut Chatbot,
-) -> Result<String, Box<dyn std::error::Error>> {
-    debug_print!("Generating organized filename");
-    let client = reqwest::Client::new();
-
-    let prompt = format!(
-        "Based on the following content, generate a concise and descriptive filename (max 50 characters) that summarizes the main topic or purpose. Title it in all caps and keep it from 1 to 4 words. Include the .md extension. Only return the filename, nothing else:\n\n{}",
-        content
-    );
-
-    // Tokenize the prompt
-    let prompt_tokens = count_tokens(&prompt)?;
-    chatbot.update_tokens(TokenCategory::Input, prompt_tokens);
-    debug_print!("Prompt tokens: {}", prompt_tokens);
-
-    let start_time = std::time::Instant::now();
-
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": DEFAULT_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 100
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
-
-    let elapsed_time = start_time.elapsed().as_millis();
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
-
-    let filename = body["content"][0]["text"]
-        .as_str()
-        .ok_or("Missing 'text' field in API response")?
-        .trim()
-        .to_string();
-
-    // Tokenize the filename and update output tokens
-    let filename_tokens = count_tokens(&filename)?;
-    chatbot.update_tokens(TokenCategory::Output, filename_tokens);
-    debug_print!("Filename tokens: {}", filename_tokens);
-
-    Ok(filename)
-}
-
-// Function to generate the context for the AI
-fn prepare_context(
-    relevant_files: &[(String, String)],
-    user_query: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut context = format!("User query: {}\n\nRelevant file contents:\n", user_query);
-    for (file_path, _) in relevant_files {
-        let file_content = read_file_contents(file_path)?;
-        context.push_str(&format!(
-            "File: {}\nContent:\n{}\n\n",
-            file_path, file_content
-        ));
-    }
-    Ok(context)
-}
-
-// Function to generate LLM response using Claude API
-async fn generate_llm_response(
-    context: &str,
-    api_key: &str,
-    conversation_history: &Vec<Message>,
-    user_query: &str,
-    chatbot: &mut Chatbot,
-    pb: &ProgressBar, // Added ProgressBar parameter
-) -> Result<(String, bool), Box<dyn std::error::Error>> {
-    pb.set_message("Generating LLM response...");
-    pb.tick();
-    yield_now().await;
-
-    let client = reqwest::Client::new();
-
-    let mut messages: Vec<Value> = conversation_history
-        .iter()
-        .map(|m| {
-            json!({
-                "role": m.role,
-                "content": m.content
-            })
-        })
-        .collect();
-
-    // Add the current context and user query
-    let user_content = format!(
-        "Based on the following context about a codebase and our previous conversation, please answer the user's query:\n\nContext: {}\n\nUser query: {}",
-        context, user_query
-    );
-
-    messages.push(json!({
-        "role": "user",
-        "content": user_content
-    }));
-
-    // Tokenize the user content and update input tokens
-    let user_tokens = count_tokens(&user_content)?;
-    chatbot.update_tokens(TokenCategory::Input, user_tokens);
-    debug_print!("User query tokens: {}", user_tokens);
-
-    pb.set_message("Sending request to Claude API for response generation...");
-    pb.tick();
-    yield_now().await;
-
-    let start_time = std::time::Instant::now();
-
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": DEFAULT_MODEL,
-            "messages": messages,
-            "system": "You are an AI assistant helping with a codebase. Use the provided context and conversation history to answer questions.",
-            "max_tokens": DEFAULT_MAX_TOKENS
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Claude API: {}", e))?;
-
-    let elapsed_time = start_time.elapsed().as_millis();
-
-    // Log the API call
-    chatbot.api_call_logs.push(ApiCallLog {
-        timestamp: Utc::now(),
-        endpoint: CLAUDE_API_URL.to_string(),
-        request_summary: "generate_llm_response".to_string(),
-        response_status: response.status().as_u16(),
-        response_time_ms: elapsed_time,
-    });
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response body: {}", e))?;
-        debug_print!("Error response body: {}", error_body);
-        pb.set_message("Failed to generate response with Claude API.");
-        pb.tick();
-        yield_now().await;
-        return Err(format!("Claude API request failed: {} - {}", status, error_body).into());
-    }
-
-    let body: Value = response.json().await?;
-    let answer = body["content"][0]["text"]
-        .as_str()
-        .ok_or_else(|| {
-            debug_print!("Missing 'text' field in API response: {:?}", body);
-            "Missing 'text' field in API response"
-        })?
-        .trim()
-        .to_string();
-
-    let is_complete = !body["stop_reason"].is_null() && body["stop_reason"] == "stop_sequence";
-
-    pb.set_message("LLM response generated successfully.");
-    pb.tick();
-    yield_now().await;
-
-    // Tokenize the AI response and update output tokens
-    let response_tokens = count_tokens(&answer)?;
-    chatbot.update_tokens(TokenCategory::Output, response_tokens);
-    debug_print!("AI response tokens: {}", response_tokens);
-
-    Ok((answer, is_complete))
-}
-
-// Function to chat with the system
-async fn chat_with_system(
-    chatbot: &mut Chatbot,
-    user_query: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Chatting with system...");
-    chatbot.chat(user_query, &pb).await
-}
-
-// Function to display API call logs in a table
-fn display_api_call_logs(chatbot: &Chatbot) {
-    if chatbot.api_call_logs.is_empty() {
-        println!("{}", "No API calls have been made yet.".yellow());
-        pause();
-        return;
-    }
-
-    let mut table = Table::new();
-    table.add_row(Row::new(vec![
-        Cell::new("Timestamp"),
-        Cell::new("Endpoint"),
-        Cell::new("Request Summary"),
-        Cell::new("Status"),
-        Cell::new("Response Time (ms)"),
-    ]));
-
-    for log in &chatbot.api_call_logs {
-        table.add_row(Row::new(vec![
-            Cell::new(&log.timestamp.to_rfc3339()),
-            Cell::new(&log.endpoint),
-            Cell::new(&log.request_summary),
-            Cell::new(&log.response_status.to_string()),
-            Cell::new(&log.response_time_ms.to_string()),
-        ]));
-    }
-
-    table.printstd();
-    pause();
-}
-
-// Function to browse the index
-fn browse_index(index: &HashMap<String, (String, String)>) {
-    let mut files: Vec<&String> = index.keys().collect();
-    files.sort();
-
-    loop {
-        clear_screen();
-        print_header("Browse Index");
-
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select a file to view its summary (or 'Back' to return)")
-            .default(0)
-            .items(&files)
-            .item("Back")
-            .interact()
-            .unwrap();
-
-        if selection == files.len() {
-            break;
-        } else {
-            let file = &files[selection];
-            if let Some((summary, language)) = index.get(*file) {
-                clear_screen();
-                print_header(&format!("File Summary: {}", file));
-                println!("{}: {}", "Language".bold(), language);
-                println!("{}: {}", "Summary".bold(), summary);
-                pause();
-            } else {
-                println!("Error: File not found in index");
-                pause();
-            }
+impl App {
+    fn new() -> App {
+        App {
+            state: AppState::MainMenu,
+            messages: Vec::new(),
+            input: String::new(),
+            tick_rate: Duration::from_millis(250),
+            selected_menu_item: 0,
+            notification: None,
+            settings: Settings {
+                ai_api_key: String::new(),
+                theme: Theme::Light,
+            },
+            last_tick: Instant::now(),
         }
     }
 }
 
-// Function to print headers with decorative borders
-fn print_header(title: &str) {
-    let width = 80; // Adjusted width for better display
-    println!(
-        "{}",
-        HEAVY_DOWN_AND_RIGHT.to_string()
-            + &HEAVY_HORIZONTAL.to_string().repeat(width - 2)
-            + &HEAVY_DOWN_AND_LEFT.to_string()
-    );
-    println!(
-        "{} {: ^width$} {}",
-        HEAVY_VERTICAL,
-        title.bold().green(),
-        HEAVY_VERTICAL
-    );
-    println!(
-        "{}",
-        HEAVY_UP_AND_RIGHT.to_string()
-            + &HEAVY_HORIZONTAL.to_string().repeat(width - 2)
-            + &HEAVY_UP_AND_LEFT.to_string()
-    );
+#[derive(Debug)]
+enum AppError {
+    IoError(io::Error),
+    ApiError(String),
+    SerdeError(serde_json::Error),
+    MissingApiKey,
 }
 
-// Function to list projects in the user's home directory and subdirectories
-fn list_projects_in_home() -> Vec<PathBuf> {
-    // Attempt to load cache
-    if let Some(cache) = cache::load_codebase_cache() {
-        return cache.codebases.iter().map(|p| PathBuf::from(p)).collect();
+impl From<io::Error> for AppError {
+    fn from(err: io::Error) -> Self {
+        AppError::IoError(err)
     }
+}
 
-    let mut projects = Vec::new();
-    if let Some(home_path) = home_dir() {
-        // Use WalkBuilder to recursively search for directories containing source files
-        let walker = WalkBuilder::new(home_path)
-            .follow_links(false)
-            .max_depth(Some(4)) // Set maximum depth to prevent excessive recursion
-            .build();
-
-        let source_extensions = [
-            "rs", "py", "go", "js", "ts", "java", "c", "cpp", "md", "toml",
-        ];
-
-        let mut project_paths = HashSet::new();
-
-        for entry in walker {
-            if let Ok(entry) = entry {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension() {
-                        if source_extensions.contains(&ext.to_string_lossy().as_ref()) {
-                            if let Some(parent) = path.parent() {
-                                // Add the parent directory as a project
-                                project_paths.insert(parent.to_path_buf());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        projects.extend(project_paths.into_iter());
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        AppError::SerdeError(err)
     }
+}
 
-    // Manually add specific directories if needed
-    let additional_paths = vec!["~/alexf/software-projects/.current"];
-    for path_str in additional_paths {
-        let expanded_path = shellexpand::tilde(path_str).into_owned();
-        let path = PathBuf::from(expanded_path);
-        if path.exists() && path.is_dir() {
-            // For the specified .current directory, add all subdirectories
-            if path_str == "~/alexf/software-projects/.current" {
-                if let Ok(entries) = fs::read_dir(&path) {
-                    for entry in entries.flatten() {
-                        if let Ok(file_type) = entry.file_type() {
-                            if file_type.is_dir() {
-                                projects.push(entry.path());
-                            }
-                        }
-                    }
-                }
-            } else {
-                projects.push(path);
-            }
+// Implement Display and Error for AppError
+impl Display for AppError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::IoError(e) => write!(f, "IO Error: {}", e),
+            AppError::ApiError(msg) => write!(f, "API Error: {}", msg),
+            AppError::SerdeError(e) => write!(f, "Serialization Error: {}", e),
+            AppError::MissingApiKey => write!(f, "Missing API Key"),
         }
     }
-
-    // Convert PathBuf to String for caching
-    let codebase_strings: Vec<String> = projects
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-
-    // Save to cache
-    if let Err(e) = cache::save_codebase_cache(&codebase_strings) {
-        debug_print!("Failed to save codebase cache: {}", e);
-    }
-
-    projects
 }
 
-// Function to search GitHub repositories
-async fn search_github_repos(query: &str) -> Result<Vec<GitHubRepo>, Box<dyn std::error::Error>> {
-    let url = format!("https://api.github.com/search/repositories?q={}", query);
-    let client = reqwest::Client::new();
-    let res = client
-        .get(&url)
-        .header(USER_AGENT, "CodebaseExplorer")
-        .header(ACCEPT, "application/vnd.github.v3+json")
-        .send()
-        .await?;
-
-    if res.status() == 403 {
-        return Err("GitHub API rate limit exceeded.".into());
-    }
-
-    let json: Value = res.json().await?;
-    let repos = json["items"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|item| serde_json::from_value(item.clone()).ok())
-        .collect();
-    Ok(repos)
-}
-
-// Function to clone a GitHub repository
-fn clone_github_repo(
-    clone_url: &str,
-    repo_name: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let clone_path = env::temp_dir().join(repo_name);
-    if clone_path.exists() {
-        println!("Repository already cloned.");
-    } else {
-        let status = Command::new("git")
-            .args(&["clone", clone_url, clone_path.to_str().unwrap()])
-            .status()?;
-        if !status.success() {
-            return Err("Failed to clone repository".into());
-        }
-    }
-    Ok(clone_path)
-}
+impl StdError for AppError {}
