@@ -1,7 +1,11 @@
 mod app;
 pub mod chat;
+pub mod ui;
 
 use app::*;
+use ui::footer::draw_footer;
+use ui::header::draw_header;
+use ui::main_menu::draw_main_menu;
 
 use chat::{Message, Sender};
 use crossterm::{
@@ -189,122 +193,6 @@ fn ui(f: &mut Frame<'_>, app: &App) {
 
     // Draw footer
     draw_footer(f, chunks[2], app);
-}
-
-/// Draws the header with ASCII art and application title
-fn draw_header(f: &mut Frame<'_>, area: Rect) {
-    // ASCII Art Logo
-    let logo = r#"
-     _____                 _
-    / ____|               | |
-   | (___  _   _ _ __ ___ | |__   ___
-    \___ \| | | | '_ ` _ \| '_ \ / _ \
-    ____) | |_| | | | | | | |_) | (_) |
-   |_____/ \__,_|_| |_| |_|_.__/ \___/
-    "#;
-
-    // Create a block for the header background
-    let block = Block::default()
-        .style(Style::default().fg(Color::LightCyan).bg(Color::Black))
-        .borders(Borders::NONE);
-
-    f.render_widget(block, area);
-
-    // Split the header area into two parts: logo and title
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(area);
-
-    // Render the logo
-    let logo_paragraph = Paragraph::new(logo)
-        .style(
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Left);
-
-    f.render_widget(logo_paragraph, chunks[0]);
-
-    // Render the title
-    let title = Paragraph::new("Sagacity - Elite Terminal Assistant")
-        .style(
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        )
-        .alignment(Alignment::Center);
-
-    f.render_widget(title, chunks[1]);
-}
-
-/// Draws the footer with dynamic instructions
-fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let instructions = match app.state {
-        AppState::MainMenu => {
-            "Use Up/Down arrows to navigate, Enter to select, 'q' or Esc to quit."
-        }
-        AppState::Chat => "Type your message and press Enter to send. Esc to return to main menu.",
-        AppState::QuitConfirm => "Press 'y' to confirm quit or 'n' to cancel.",
-        _ => "Press 'q' or Esc to quit.",
-    };
-
-    let footer = Paragraph::new(instructions)
-        .style(Style::default().fg(Color::LightCyan))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(footer, area);
-}
-
-/// Draws the main menu with selectable items and icons
-fn draw_main_menu(f: &mut Frame<'_>, area: Rect, app: &App) {
-    // Create a block for the menu background
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Main Menu")
-        .style(Style::default().fg(Color::LightYellow).bg(Color::Black));
-
-    f.render_widget(block, area);
-
-    // Define menu items with icons
-    let items: Vec<ListItem> = app
-        .menu_items
-        .iter()
-        .enumerate()
-        .map(|(i, &item)| {
-            if i == app.selected_menu_item {
-                ListItem::new(item).style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::LightMagenta)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ListItem::new(item).style(Style::default().fg(Color::White))
-            }
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::default())
-        .highlight_style(
-            Style::default()
-                .bg(Color::LightMagenta)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("➤ ");
-
-    // Calculate the layout for the list
-    let list_area = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(2)
-        .constraints([Constraint::Min(1)].as_ref())
-        .split(area)[0];
-
-    f.render_widget(list, list_area);
 }
 
 /// Draws the chat interface with message display and input area
