@@ -1,5 +1,7 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -85,6 +87,40 @@ async fn run_ui(
                         KeyCode::Char('q') | KeyCode::Esc => app.state = AppState::QuitConfirm,
                         _ => {}
                     },
+                    AppState::Chat => match key.code {
+                        KeyCode::Esc => {
+                            app.state = AppState::MainMenu;
+                        }
+                        KeyCode::Enter => {
+                            let user_message = app.input.drain(..).collect::<String>();
+                            if !user_message.trim().is_empty() {
+                                app.messages.push(Message {
+                                    sender: Sender::User,
+                                    content: user_message.clone(),
+                                });
+                                // Here you can implement sending the message to your backend or AI
+                                // For demonstration, we'll add a mock AI response
+                                app.messages.push(Message {
+                                    sender: Sender::AI,
+                                    content: format!("Echo: {}", user_message),
+                                });
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Handle Ctrl+C for quitting
+                                if c == 'c' {
+                                    app.state = AppState::QuitConfirm;
+                                }
+                            } else {
+                                app.input.push(c);
+                            }
+                        }
+                        _ => {}
+                    },
                     AppState::QuitConfirm => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
                             app.state = AppState::Quit;
@@ -96,7 +132,7 @@ async fn run_ui(
                     },
                     // Handle other states if necessary
                     _ => {
-                        // From any other state, pressing 'q' or Esc brings back to main menu
+                        // From any other state, pressing 'q' or Esc brings up the quit confirmation prompt
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => app.state = AppState::QuitConfirm,
                             _ => {}
@@ -136,7 +172,7 @@ fn ui(f: &mut Frame<'_>, app: &App) {
     // Draw body based on state
     match app.state {
         AppState::MainMenu => draw_main_menu(f, chunks[1], app),
-        AppState::Chat => draw_placeholder(f, chunks[1], "Chat"),
+        AppState::Chat => draw_chat(f, chunks[1], app),
         AppState::BrowseIndex => draw_placeholder(f, chunks[1], "Browse Index"),
         AppState::GitHubRecommendations => draw_placeholder(f, chunks[1], "GitHub Recommendations"),
         AppState::Help => draw_placeholder(f, chunks[1], "Help"),
@@ -203,6 +239,7 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
         AppState::MainMenu => {
             "Use Up/Down arrows to navigate, Enter to select, 'q' or Esc to quit."
         }
+        AppState::Chat => "Type your message and press Enter to send. Esc to return to main menu.",
         AppState::QuitConfirm => "Press 'y' to confirm quit or 'n' to cancel.",
         _ => "Press 'q' or Esc to quit.",
     };
@@ -262,6 +299,72 @@ fn draw_main_menu(f: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area)[0];
 
     f.render_widget(list, list_area);
+}
+
+/// Draws the chat interface with message display and input area
+fn draw_chat(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Create a block for the chat background
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Chat")
+        .style(Style::default().fg(Color::LightYellow).bg(Color::Black));
+
+    f.render_widget(block, area);
+
+    // Split chat area into message view and input
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(
+            [
+                Constraint::Min(1),    // Messages
+                Constraint::Length(3), // Input
+            ]
+            .as_ref(),
+        )
+        .split(area);
+
+    // Render messages
+    let messages: Vec<ListItem> = app
+        .messages
+        .iter()
+        .map(|msg| {
+            let prefix = match msg.sender {
+                Sender::User => "💬 You: ",
+                Sender::AI => "🤖 AI: ",
+            };
+            ListItem::new(format!("{}{}", prefix, msg.content)).style(
+                Style::default()
+                    .fg(match msg.sender {
+                        Sender::User => Color::LightGreen,
+                        Sender::AI => Color::LightBlue,
+                    })
+                    .add_modifier(Modifier::ITALIC),
+            )
+        })
+        .collect();
+
+    let messages_list = List::new(messages)
+        .block(Block::default())
+        .style(Style::default())
+        .highlight_style(Style::default())
+        .highlight_symbol("");
+
+    f.render_widget(messages_list, chunks[0]);
+
+    // Render input box
+    let input = Paragraph::new(app.input.as_str())
+        .style(Style::default().fg(Color::LightYellow))
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(input, chunks[1]);
+
+    // Set cursor position
+    let x = chunks[1].x + app.input.len() as u16 + 1;
+    let y = chunks[1].y + 1;
+    f.set_cursor(x, y);
 }
 
 /// Draws placeholder screens for different states with enhanced styling
@@ -327,11 +430,27 @@ enum AppState {
     Quit,
 }
 
+/// Represents the sender of a message
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sender {
+    User,
+    AI,
+}
+
+/// Represents a chat message
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Message {
+    sender: Sender,
+    content: String,
+}
+
 /// The main application structure
 struct App {
     state: AppState,
     menu_items: Vec<&'static str>,
     selected_menu_item: usize,
+    messages: Vec<Message>,
+    input: String,
 }
 
 impl App {
@@ -347,6 +466,8 @@ impl App {
                 "🚪 Quit",
             ],
             selected_menu_item: 0,
+            messages: Vec::new(),
+            input: String::new(),
         }
     }
 }
