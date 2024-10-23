@@ -1,6 +1,4 @@
-use crate::chat;
-
-use chat::*;
+use crate::ui::chat::Message;
 
 /// Represents the different states of the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
