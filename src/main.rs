@@ -1,7 +1,9 @@
-mod app_state;
+mod app;
+pub mod chat;
 
-use app_state::AppState;
+use app::*;
 
+use chat::{Message, Sender};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers,
@@ -103,7 +105,7 @@ async fn run_ui(
                                     content: user_message.clone(),
                                 });
                                 // Here you can implement sending the message to your backend or AI
-                                // For demonstration, we'll add a mock AI response
+                                // For demonstration, we'll add a mock AI responsestruct Sen
                                 app.messages.push(Message {
                                     sender: Sender::AI,
                                     content: format!("Echo: {}", user_message),
@@ -419,48 +421,4 @@ fn draw_quit_confirm(f: &mut Frame<'_>, area: Rect) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
-}
-
-
-
-/// Represents the sender of a message
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Sender {
-    User,
-    AI,
-}
-
-/// Represents a chat message
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Message {
-    sender: Sender,
-    content: String,
-}
-
-/// The main application structure
-struct App {
-    state: AppState,
-    menu_items: Vec<&'static str>,
-    selected_menu_item: usize,
-    messages: Vec<Message>,
-    input: String,
-}
-
-impl App {
-    fn new() -> App {
-        App {
-            state: AppState::MainMenu,
-            menu_items: vec![
-                "💬 Chat",
-                "📂 Browse Index",
-                "🔍 GitHub Recommendations",
-                "❓ Help",
-                "⚙️ Settings",
-                "🚪 Quit",
-            ],
-            selected_menu_item: 0,
-            messages: Vec::new(),
-            input: String::new(),
-        }
-    }
 }
