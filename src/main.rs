@@ -184,7 +184,11 @@ fn ui(f: &mut Frame<'_>, app: &App) {
         AppState::Help => draw_placeholder(f, chunks[1], "Help"),
         AppState::Settings => draw_placeholder(f, chunks[1], "Settings"),
         AppState::QuitConfirm => draw_quit_confirm(f, chunks[1]),
-        AppState::Quit => {} // No need to draw anything; main loop will exit
+        AppState::SelectCodebase => {
+            // Render the directory tree
+            app.dir_tree.render(f, chunks[1]);
+        }
+        AppState::Quit => {}
     }
 
     // Draw footer

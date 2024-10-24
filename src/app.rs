@@ -1,6 +1,12 @@
-use crate::ui::chat::Message;
+use colored::Colorize;
+use home::home_dir;
+use std::path::PathBuf;
 
-/// Represents the different states of the application
+use crate::ui::chat::Message;
+use crate::ui::directory_tree::DirectoryTree;
+
+// src/app.rs or within your main App module
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
     MainMenu,
@@ -11,6 +17,7 @@ pub enum AppState {
     Settings,
     QuitConfirm,
     Quit,
+    SelectCodebase, // New state for codebase selection
 }
 
 pub struct App {
@@ -19,6 +26,8 @@ pub struct App {
     pub selected_menu_item: usize,
     pub messages: Vec<Message>,
     pub input: String,
+    // Add fields for directory tree navigation
+    pub dir_tree: DirectoryTree,
 }
 
 impl App {
@@ -26,9 +35,11 @@ impl App {
         App {
             state: AppState::MainMenu,
             menu_items: vec![
-                "💬 Chat",
+                "💬 Chat with any codebase in ~/",
+                "💬 Chat with CWD",
+                "💬 Chat with GitHub Repo",
                 "📂 Browse Index",
-                "🔍 GitHub Recommendations",
+                "🔍 Browse GitHub Recommendations",
                 "❓ Help",
                 "⚙️ Settings",
                 "🚪 Quit",
@@ -36,6 +47,7 @@ impl App {
             selected_menu_item: 0,
             messages: Vec::new(),
             input: String::new(),
+            dir_tree: DirectoryTree::new(home_dir().unwrap_or(PathBuf::from("/"))),
         }
     }
 }
