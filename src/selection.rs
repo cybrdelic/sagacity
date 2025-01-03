@@ -1,5 +1,3 @@
-// src/selection.rs
-
 use crate::cache::{load_codebase_cache, save_codebase_cache};
 use crate::constants::*;
 use colored::Colorize;
@@ -15,43 +13,55 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-// Struct for GitHub repository information
 #[derive(Deserialize)]
 struct GitHubRepo {
     full_name: String,
     clone_url: String,
 }
 
-// Function to scan a custom directory and return a list of project paths
+// clone_github_repo defined here
+pub fn clone_github_repo(
+    clone_url: &str,
+    repo_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let clone_path = env::temp_dir().join(repo_name);
+    if clone_path.exists() {
+        println!("Repository already cloned.");
+    } else {
+        let status = Command::new("git")
+            .args(&["clone", clone_url, clone_path.to_str().unwrap()])
+            .status()?;
+        if !status.success() {
+            return Err("Failed to clone repository".into());
+        }
+    }
+    Ok(clone_path)
+}
+
+// same scanning functions as before...
 pub fn scan_custom_directory(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut codebase_strings = Vec::new();
 
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-
         let path = entry.path();
-
         if path.is_dir() {
             codebase_strings.push(path.display().to_string());
         }
     }
-
     Ok(codebase_strings)
 }
 
-// Function to list projects in the user's home directory and subdirectories
 fn list_projects_in_home() -> Vec<PathBuf> {
-    // Attempt to load cache
     if let Some(cache) = load_codebase_cache() {
         return cache.codebases.iter().map(|p| PathBuf::from(p)).collect();
     }
 
     let mut projects = Vec::new();
     if let Some(home_path) = home::home_dir() {
-        // Use WalkBuilder to recursively search for directories containing source files
         let walker = WalkBuilder::new(home_path)
             .follow_links(false)
-            .max_depth(Some(4)) // Set maximum depth to prevent excessive recursion
+            .max_depth(Some(4))
             .build();
 
         let source_extensions = [
@@ -59,7 +69,6 @@ fn list_projects_in_home() -> Vec<PathBuf> {
         ];
 
         let mut project_paths = HashSet::new();
-
         for entry in walker {
             if let Ok(entry) = entry {
                 if entry.file_type().map_or(false, |ft| ft.is_file()) {
@@ -67,7 +76,6 @@ fn list_projects_in_home() -> Vec<PathBuf> {
                     if let Some(ext) = path.extension() {
                         if source_extensions.contains(&ext.to_string_lossy().as_ref()) {
                             if let Some(parent) = path.parent() {
-                                // Add the parent directory as a project
                                 project_paths.insert(parent.to_path_buf());
                             }
                         }
@@ -79,13 +87,11 @@ fn list_projects_in_home() -> Vec<PathBuf> {
         projects.extend(project_paths.into_iter());
     }
 
-    // Manually add specific directories if needed
     let additional_paths = vec!["~/alexf/software-projects/.current"];
     for path_str in additional_paths {
         let expanded_path = shellexpand::tilde(path_str).into_owned();
         let path = PathBuf::from(expanded_path);
         if path.exists() && path.is_dir() {
-            // For the specified .current directory, add all subdirectories
             if path_str == "~/alexf/software-projects/.current" {
                 if let Ok(entries) = fs::read_dir(&path) {
                     for entry in entries.flatten() {
@@ -102,13 +108,11 @@ fn list_projects_in_home() -> Vec<PathBuf> {
         }
     }
 
-    // Convert PathBuf to String for caching
     let codebase_strings: Vec<String> = projects
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    // Save to cache
     if let Err(e) = save_codebase_cache(&codebase_strings) {
         println!("Failed to save codebase cache: {}", e);
     }
@@ -116,7 +120,6 @@ fn list_projects_in_home() -> Vec<PathBuf> {
     projects
 }
 
-// Function to search GitHub repositories
 async fn search_github_repos(query: &str) -> Result<Vec<GitHubRepo>, Box<dyn std::error::Error>> {
     let url = format!("https://api.github.com/search/repositories?q={}", query);
     let client = reqwest::Client::new();
@@ -141,26 +144,6 @@ async fn search_github_repos(query: &str) -> Result<Vec<GitHubRepo>, Box<dyn std
     Ok(repos)
 }
 
-// Function to clone a GitHub repository
-fn clone_github_repo(
-    clone_url: &str,
-    repo_name: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let clone_path = env::temp_dir().join(repo_name);
-    if clone_path.exists() {
-        println!("Repository already cloned.");
-    } else {
-        let status = Command::new("git")
-            .args(&["clone", clone_url, clone_path.to_str().unwrap()])
-            .status()?;
-        if !status.success() {
-            return Err("Failed to clone repository".into());
-        }
-    }
-    Ok(clone_path)
-}
-
-// Function for the codebase selection menu
 pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Error>> {
     loop {
         let choices = vec![
@@ -186,16 +169,13 @@ pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Er
                     {
                         continue;
                     } else {
-                        // Switch to GitHub search
                         continue;
                     }
                 }
 
-                // Convert PathBuf to String for `skim`
                 let project_names: Vec<String> =
                     projects.iter().map(|p| p.display().to_string()).collect();
 
-                // Use Skim for fuzzy search
                 let options = SkimOptionsBuilder::default()
                     .height(Some("50%"))
                     .multi(false)
@@ -207,7 +187,7 @@ pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Er
                 for project in project_names.clone() {
                     let _ = tx.send(Arc::new(project) as Arc<dyn SkimItem>);
                 }
-                drop(tx); // Close the sender to indicate no more items will be sent
+                drop(tx);
                 let selected = Skim::run_with(&options, Some(rx))
                     .map(|out| out.selected_items)
                     .unwrap_or_else(|| Vec::new());
@@ -253,31 +233,24 @@ pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Er
                     .interact()?;
 
                 let repo = &repos[repo_selection];
-                // Clone the repository to a local directory
                 let clone_path = clone_github_repo(&repo.clone_url, &repo.full_name)?;
                 return Ok(clone_path);
             }
             2 => {
-                // Specify Custom Directory
                 let custom_path: String = Input::with_theme(&ColorfulTheme::default())
                     .with_prompt("Enter the full path of the directory to search")
                     .interact_text()?;
                 let expanded_path = shellexpand::tilde(&custom_path).to_string();
                 let path = PathBuf::from(expanded_path);
                 if path.exists() && path.is_dir() {
-                    // Optionally, you can add this path to the cache or a separate list
                     println!("Scanning custom directory: {}", path.display());
-
-                    // Scan and cache the custom directory
                     let codebase_strings = scan_custom_directory(&path)?;
                     if !codebase_strings.is_empty() {
-                        // Save to cache
                         if let Err(e) = save_codebase_cache(&codebase_strings) {
                             println!("Failed to save codebase cache: {}", e);
                         }
                         let codebases: Vec<PathBuf> =
                             codebase_strings.iter().map(PathBuf::from).collect();
-                        // Present the codebases with fuzzy search
                         let options = SkimOptionsBuilder::default()
                             .height(Some("50%"))
                             .multi(false)
@@ -289,7 +262,7 @@ pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Er
                         for codebase in codebase_strings.clone() {
                             let _ = tx.send(Arc::new(codebase) as Arc<dyn SkimItem>);
                         }
-                        drop(tx); // Close the sender to indicate no more items will be sent
+                        drop(tx);
                         let selected = Skim::run_with(&options, Some(rx))
                             .map(|out| out.selected_items)
                             .unwrap_or_else(|| Vec::new());

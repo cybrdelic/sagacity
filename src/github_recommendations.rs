@@ -1,10 +1,5 @@
-// src/github_recommendations.rs
-
-use crate::clone_github_repo;
-use crate::constants::*;
-use crate::generate_llm_response;
+use crate::chatbot::{detect_language, generate_llm_response, summarize_with_claude, IndexCache};
 use crate::Chatbot;
-use crate::summarize_with_claude;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
@@ -14,14 +9,15 @@ use prettytable::{Cell, Row, Table};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use serde_json::Value;
+use shellexpand;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use std::time::UNIX_EPOCH; // for Chatbot struct
 
-// Struct for GitHub repository information
 #[derive(Deserialize, Debug)]
 pub struct GitHubRepo {
     pub full_name: String,
@@ -37,11 +33,10 @@ macro_rules! debug_print {
         eprintln!("[DEBUG] {}", format!($($arg)*));
     };
 }
-// Function to scan `.current/` directory and aggregate indexes
+
 pub async fn generate_github_recommendations(
     chatbot: &mut Chatbot,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Define the path to the `.current/` directory
     let current_dir = shellexpand::tilde("~/alexf/software-projects/.current/").to_string();
     let current_path = PathBuf::from(current_dir);
 
@@ -53,7 +48,6 @@ pub async fn generate_github_recommendations(
         return Ok(());
     }
 
-    // Scan all codebases in `.current/`
     let codebases = scan_current_directory(&current_path)?;
 
     if codebases.is_empty() {
@@ -64,7 +58,6 @@ pub async fn generate_github_recommendations(
         return Ok(());
     }
 
-    // Load or create index caches for each codebase
     let mut aggregated_context = String::new();
     let pb = ProgressBar::new(codebases.len() as u64);
     pb.set_style(
@@ -76,21 +69,15 @@ pub async fn generate_github_recommendations(
 
     for codebase in codebases {
         pb.set_message(format!("Processing: {}", codebase.display()));
-
-        // Load or create index cache
         let index = load_or_create_index_cache(&codebase, chatbot).await?;
-
-        // Append to aggregated context
         for (_file, (summary, _language)) in index {
             aggregated_context.push_str(&format!("{}\n", summary));
         }
-
         pb.inc(1);
     }
 
     pb.finish_with_message("Aggregation complete.");
 
-    // Use the aggregated context to search GitHub
     println!(
         "{}",
         "Generating GitHub recommendations based on your codebases..."
@@ -105,18 +92,16 @@ pub async fn generate_github_recommendations(
         return Ok(());
     }
 
-    // Present the recommendations to the user
     present_github_recommendations(&github_repos);
 
     Ok(())
 }
 
-// Function to scan `.current/` directory for codebases
 fn scan_current_directory(
     current_path: &PathBuf,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut codebases = Vec::new();
-    for entry in std::fs::read_dir(current_path)? {
+    for entry in fs::read_dir(current_path)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -125,6 +110,7 @@ fn scan_current_directory(
     }
     Ok(codebases)
 }
+
 async fn load_or_create_index_cache(
     codebase_path: &PathBuf,
     chatbot: &mut Chatbot,
@@ -132,20 +118,17 @@ async fn load_or_create_index_cache(
     let cache_path = codebase_path.join("index_cache.json");
 
     if cache_path.exists() {
-        // Load existing cache
         let cache_content = fs::read_to_string(&cache_path)?;
-        let cache: crate::IndexCache = serde_json::from_str(&cache_content)?;
+        let cache: IndexCache = serde_json::from_str(&cache_content)?;
         debug_print!("Loaded index cache for {}", codebase_path.display());
         Ok(cache.index)
     } else {
-        // Create new index
         let index = index_codebase_specific(codebase_path, chatbot).await?;
-        // Save to cache
-        let cache = crate::IndexCache {
+        let cache = IndexCache {
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            last_modification: 0, // Update as needed
+            last_modification: 0,
             index: index.clone(),
-            file_mod_times: HashMap::new(), // Update as needed
+            file_mod_times: HashMap::new(),
         };
         let serialized = serde_json::to_string_pretty(&cache)?;
         fs::write(&cache_path, serialized)?;
@@ -157,7 +140,6 @@ async fn load_or_create_index_cache(
     }
 }
 
-// Function to index a specific codebase
 async fn index_codebase_specific(
     codebase_path: &PathBuf,
     chatbot: &mut Chatbot,
@@ -194,28 +176,21 @@ async fn index_codebase_specific(
 
     for file_path in files {
         pb.set_message(format!("Processing file: {}", file_path));
-        // Read file content
         let content = fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
-
-        // Detect language
-        let language = crate::detect_language(&file_path);
-
-        // Extract the api_key before mutable borrow
+        let language = detect_language(&file_path);
         let api_key = chatbot.api_key.clone();
 
-        // Summarize with Claude
-        let summary =
-            match crate::summarize_with_claude(&content, &api_key, &language, chatbot).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug_print!("Error summarizing {}: {}", file_path, e);
-                    format!(
-                        "Failed to summarize. File content preview: {}",
-                        &content[..std::cmp::min(content.len(), 100)]
-                    )
-                }
-            };
+        let summary = match summarize_with_claude(&content, &api_key, &language, chatbot).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug_print!("Error summarizing {}: {}", file_path, e);
+                format!(
+                    "Failed to summarize. File content preview: {}",
+                    &content[..std::cmp::min(content.len(), 100)]
+                )
+            }
+        };
 
         index.insert(file_path.clone(), (summary, language));
         pb.inc(1);
@@ -226,21 +201,15 @@ async fn index_codebase_specific(
     Ok(index)
 }
 
-// Function to search GitHub repositories based on aggregated context
 async fn search_github_repos(
     aggregated_context: &str,
 ) -> Result<Vec<GitHubRepo>, Box<dyn std::error::Error>> {
-    // Use the aggregated context as the search query
-    // Here, we'll extract keywords from the context for a more effective search
     let keywords = extract_keywords(aggregated_context);
-
     if keywords.is_empty() {
         return Ok(Vec::new());
     }
 
     let query = keywords.join("+");
-
-    // GitHub Search API
     let url = format!(
         "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=10",
         query
@@ -260,24 +229,20 @@ async fn search_github_repos(
     let body: Value = response.json().await?;
     let repos: Vec<GitHubRepo> =
         serde_json::from_value(body["items"].clone()).unwrap_or(Vec::new());
-
     Ok(repos)
 }
 
-// Function to extract keywords from aggregated context
 fn extract_keywords(context: &str) -> Vec<String> {
-    // Simple keyword extraction: split by whitespace and collect unique words longer than 4 characters
     let mut keywords = HashSet::new();
     for word in context.split_whitespace() {
-        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
-        if word.len() > 4 {
-            keywords.insert(word.to_lowercase());
+        let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if w.len() > 4 {
+            keywords.insert(w.to_lowercase());
         }
     }
     keywords.into_iter().collect()
 }
 
-// Function to present GitHub recommendations to the user
 fn present_github_recommendations(repos: &[GitHubRepo]) {
     println!("{}", "\n--- GitHub Recommendations ---".bold().green());
 
@@ -302,7 +267,6 @@ fn present_github_recommendations(repos: &[GitHubRepo]) {
 
     table.printstd();
 
-    // Allow user to select a repository to clone or open in browser
     let choices: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select a repository to clone or open")
@@ -340,4 +304,23 @@ fn present_github_recommendations(repos: &[GitHubRepo]) {
             _ => unreachable!(),
         }
     }
+}
+
+// Define clone_github_repo locally here to fix the unresolved import issue
+fn clone_github_repo(
+    clone_url: &str,
+    repo_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let clone_path = env::temp_dir().join(repo_name);
+    if clone_path.exists() {
+        println!("Repository already cloned.");
+    } else {
+        let status = std::process::Command::new("git")
+            .args(&["clone", clone_url, clone_path.to_str().unwrap()])
+            .status()?;
+        if !status.success() {
+            return Err("Failed to clone repository".into());
+        }
+    }
+    Ok(clone_path)
 }

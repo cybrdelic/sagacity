@@ -1,196 +1,453 @@
-mod app;
-pub mod ui;
+// src/main.rs
 
-use app::*;
-use ui::chat::draw_chat;
-use ui::chat::{Message, Sender};
-use ui::footer::draw_footer;
-use ui::header::draw_header;
-use ui::main_menu::draw_main_menu;
-use ui::placeholder::draw_placeholder;
-use ui::quit_confirm::draw_quit_confirm;
-
-use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers,
-    },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    Frame, Terminal,
-};
-use std::{error::Error as StdError, io, time::Duration};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn StdError>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create application instance
-    let mut app = App::new();
-
-    // Run the UI
-    let res = run_ui(&mut terminal, &mut app).await;
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = res {
-        eprintln!("Error: {}", err);
+mod batch_processor {
+    #[derive(Debug)]
+    pub struct BatchProcessor;
+    impl BatchProcessor {
+        pub fn new() -> Self {
+            Self
+        }
     }
-
-    Ok(())
 }
 
-/// Runs the UI loop of the application
-async fn run_ui(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<(), Box<dyn StdError>> {
-    loop {
-        terminal.draw(|f| ui(f, app))?;
+mod cache {
+    #[derive(Debug)]
+    pub struct CodebaseCache {
+        pub codebases: Vec<String>,
+    }
+    pub const CACHE_EXPIRY_SECS: u64 = 0;
+    pub const CACHE_FILE: &str = "dummy.cache";
+    pub fn load_codebase_cache() -> Option<CodebaseCache> {
+        None
+    }
+    pub fn save_codebase_cache(_p: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+}
 
-        // Poll for events with a timeout
-        if event::poll(Duration::from_millis(100))? {
-            if let CEvent::Key(key) = event::read()? {
-                match app.state {
-                    AppState::MainMenu => match key.code {
-                        KeyCode::Up => {
-                            if app.selected_menu_item > 0 {
-                                app.selected_menu_item -= 1;
-                            }
-                        }
-                        KeyCode::Down => {
-                            if app.selected_menu_item < app.menu_items.len() - 1 {
-                                app.selected_menu_item += 1;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            // Change state based on selected menu item
-                            app.state = match app.selected_menu_item {
-                                0 => AppState::Chat,
-                                1 => AppState::BrowseIndex,
-                                2 => AppState::GitHubRecommendations,
-                                3 => AppState::Help,
-                                4 => AppState::Settings,
-                                5 => AppState::QuitConfirm,
-                                _ => AppState::MainMenu,
-                            };
-                        }
-                        KeyCode::Char('q') | KeyCode::Esc => app.state = AppState::QuitConfirm,
-                        _ => {}
-                    },
-                    AppState::Chat => match key.code {
-                        KeyCode::Esc => {
-                            app.state = AppState::MainMenu;
-                        }
-                        KeyCode::Enter => {
-                            let user_message = app.input.drain(..).collect::<String>();
-                            if !user_message.trim().is_empty() {
-                                app.messages.push(Message {
-                                    sender: Sender::User,
-                                    content: user_message.clone(),
-                                });
-                                // Here you can implement sending the message to your backend or AI
-                                // For demonstration, we'll add a mock AI responsestruct Sen
-                                app.messages.push(Message {
-                                    sender: Sender::AI,
-                                    content: format!("Echo: {}", user_message),
-                                });
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                // Handle Ctrl+C for quitting
-                                if c == 'c' {
-                                    app.state = AppState::QuitConfirm;
-                                }
-                            } else {
-                                app.input.push(c);
-                            }
-                        }
-                        _ => {}
-                    },
-                    AppState::QuitConfirm => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => {
-                            app.state = AppState::Quit;
-                        }
-                        KeyCode::Char('n') | KeyCode::Esc => {
-                            app.state = AppState::MainMenu;
-                        }
-                        _ => {}
-                    },
-                    // Handle other states if necessary
-                    _ => {
-                        // From any other state, pressing 'q' or Esc brings up the quit confirmation prompt
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => app.state = AppState::QuitConfirm,
-                            _ => {}
-                        }
+mod constants {
+    pub const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/complete";
+    pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+    pub const DEFAULT_MODEL: &str = "claude-v1";
+    pub const DEFAULT_MAX_TOKENS: i32 = 2048;
+}
+
+mod github_recommendations {
+    pub async fn generate_github_recommendations() -> Result<(), Box<dyn std::error::Error>> {
+        println!("(stub) github recommendations code here");
+        Ok(())
+    }
+}
+
+mod selection {
+    use std::path::PathBuf;
+    pub async fn codebase_selection_menu() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        println!("(stub) selection code here");
+        Ok(PathBuf::from("."))
+    }
+}
+
+use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::execute;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+
+use crate::batch_processor::*;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::io::{self};
+use std::time::Duration as StdDuration;
+use tachyonfx::{
+    fx, CellFilter, Duration as TachyonDuration, Effect, EffectTimer, Interpolation, Motion, Shader,
+};
+use unicode_width::UnicodeWidthStr;
+
+#[derive(Debug)]
+struct ApiCallLog {
+    timestamp: DateTime<Utc>,
+    endpoint: String,
+    request_summary: String,
+    response_status: u16,
+    response_time_ms: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexCache {
+    timestamp: u64,
+    last_modification: u64,
+    index: HashMap<String, (String, String)>,
+    file_mod_times: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Message {
+    role: String,
+    content: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct ConversationSession {
+    name: String,
+    index: HashMap<String, (String, String)>,
+    memory: Vec<Message>,
+}
+
+enum TokenCategory {
+    Input,
+    CacheWrite,
+    CacheHit,
+    Output,
+}
+
+#[derive(Debug)]
+struct CostRates {
+    input: f64,
+    cache_write: f64,
+    cache_hit: f64,
+    output: f64,
+}
+
+impl CostRates {
+    fn get_rates() -> Self {
+        CostRates {
+            input: 3.00,
+            cache_write: 3.75,
+            cache_hit: 0.30,
+            output: 15.00,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Chatbot {
+    index: HashMap<String, (String, String)>,
+    api_key: String,
+    memory: Vec<Message>,
+    sessions: Vec<ConversationSession>,
+    current_session: Option<usize>,
+    api_call_logs: Vec<ApiCallLog>,
+    file_mod_times: HashMap<String, u64>,
+
+    input_tokens: usize,
+    cache_write_tokens: usize,
+    cache_hit_tokens: usize,
+    output_tokens: usize,
+
+    input_cost: f64,
+    cache_write_cost: f64,
+    cache_hit_cost: f64,
+    output_cost: f64,
+
+    cost_rates: CostRates,
+    batch_processor: BatchProcessor,
+}
+
+impl Chatbot {
+    fn new(
+        index: HashMap<String, (String, String)>,
+        file_mod_times: HashMap<String, u64>,
+        api_key: String,
+    ) -> Self {
+        Self {
+            index,
+            api_key,
+            memory: Vec::new(),
+            sessions: Vec::new(),
+            current_session: None,
+            api_call_logs: Vec::new(),
+            file_mod_times,
+
+            input_tokens: 0,
+            cache_write_tokens: 0,
+            cache_hit_tokens: 0,
+            output_tokens: 0,
+
+            input_cost: 0.0,
+            cache_write_cost: 0.0,
+            cache_hit_cost: 0.0,
+            output_cost: 0.0,
+            cost_rates: CostRates::get_rates(),
+            batch_processor: BatchProcessor::new(),
+        }
+    }
+
+    fn update_tokens(&mut self, category: TokenCategory, tokens: usize) {
+        match category {
+            TokenCategory::Input => {
+                self.input_tokens += tokens;
+                self.input_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.input;
+            }
+            TokenCategory::CacheWrite => {
+                self.cache_write_tokens += tokens;
+                self.cache_write_cost +=
+                    (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_write;
+            }
+            TokenCategory::CacheHit => {
+                self.cache_hit_tokens += tokens;
+                self.cache_hit_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.cache_hit;
+            }
+            TokenCategory::Output => {
+                self.output_tokens += tokens;
+                self.output_cost += (tokens as f64 / 1_000_000.0) * self.cost_rates.output;
+            }
+        }
+    }
+
+    fn total_tokens(&self) -> usize {
+        self.input_tokens + self.cache_write_tokens + self.cache_hit_tokens + self.output_tokens
+    }
+
+    fn total_cost(&self) -> f64 {
+        self.input_cost + self.cache_write_cost + self.cache_hit_cost + self.output_cost
+    }
+}
+
+struct MessageEffect {
+    message: Message,
+    fade_in: Effect,
+}
+
+impl MessageEffect {
+    fn new(message: Message) -> Self {
+        let fade_timer =
+            EffectTimer::new(StdDuration::from_millis(500).into(), Interpolation::Linear);
+        let mut fade_in = fx::fade_from_fg(Color::DarkGray, fade_timer);
+        fade_in.set_cell_selection(CellFilter::All);
+
+        Self { message, fade_in }
+    }
+
+    fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let style_color = if self.message.role == "assistant" {
+            Color::LightCyan
+        } else {
+            Color::LightYellow
+        };
+
+        let prefix = format!("{}: ", self.message.role);
+        let content = Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(style_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                self.message.content.clone(),
+                Style::default().fg(style_color),
+            ),
+        ]);
+
+        let message_block = Block::default().style(Style::default().fg(style_color));
+
+        let paragraph = Paragraph::new(content)
+            .block(message_block)
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+
+        self.fade_in
+            .execute(TachyonDuration::from_millis(16), area, f.buffer_mut());
+    }
+}
+
+fn get_claude_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(k) = env::var("ANTHROPIC_API_KEY") {
+        Ok(k)
+    } else {
+        Err("missing ANTHROPIC_API_KEY env var".into())
+    }
+}
+
+async fn index_codebase_stub(
+    _root: &str,
+    _api_key: &str,
+    _chatbot: &mut Chatbot,
+) -> Result<HashMap<String, (String, String)>, Box<dyn std::error::Error>> {
+    let mut map = HashMap::new();
+    map.insert(
+        "src/main.rs".to_string(),
+        ("(dummy summary)".to_string(), "rust".to_string()),
+    );
+    Ok(map)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize API and chatbot
+    let _api_key = get_claude_api_key().unwrap_or("dummy_key".to_string());
+    let idx = index_codebase_stub(
+        ".",
+        &_api_key,
+        &mut Chatbot::new(HashMap::new(), HashMap::new(), _api_key.clone()),
+    )
+    .await?;
+    let mut chatbot = Chatbot::new(idx, HashMap::new(), _api_key.clone());
+
+    // Initialize terminal
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    // Chat state
+    let mut input = String::new();
+    let mut input_mode = false;
+    let mut message_effects: Vec<MessageEffect> = Vec::new();
+    message_effects.push(MessageEffect::new(Message {
+        role: "assistant".to_string(),
+        content: "Hello! I'm Claude. How can I help you today?".to_string(),
+        timestamp: Utc::now(),
+    }));
+
+    // Initialize slide effect for input box
+    let slide_timer = EffectTimer::new(StdDuration::from_millis(300).into(), Interpolation::Linear);
+    let mut slide_effect = fx::slide_in(
+        Motion::RightToLeft,
+        10, // offset_x
+        0,  // offset_y
+        Color::Black,
+        slide_timer,
+    );
+
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Min(3),    // Messages area
+                    Constraint::Length(3), // Input area
+                    Constraint::Length(1), // Status bar
+                ])
+                .split(f.area());
+
+            // Messages area
+            let messages_block = Block::default()
+                .title("Chat History")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue));
+
+            let messages_area = messages_block.inner(chunks[0]);
+            f.render_widget(messages_block, chunks[0]);
+
+            // Render messages with spacing
+            let message_height = 3;
+            for (i, msg_effect) in message_effects.iter_mut().enumerate() {
+                let msg_area = Rect::new(
+                    messages_area.x,
+                    messages_area.y + (i as u16 * message_height),
+                    messages_area.width,
+                    message_height,
+                );
+                msg_effect.render(f, msg_area);
+            }
+
+            // Input area with mode indicator
+            let input_style = if input_mode {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Blue)
+            };
+
+            let input_block = Block::default()
+                .title(if input_mode {
+                    "Input (Active)"
+                } else {
+                    "Input (Press Tab)"
+                })
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_style(input_style);
+
+            let input_text = Paragraph::new(input.as_str())
+                .block(input_block)
+                .style(Style::default().fg(Color::White))
+                .wrap(Wrap { trim: true });
+
+            f.render_widget(input_text, chunks[1]);
+
+            // Status bar
+            let status = format!(
+                "Messages: {} | Tab: Toggle Input | Ctrl+C: Exit",
+                message_effects.len()
+            );
+            let status_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+
+            let status_text = Paragraph::new(status)
+                .block(status_block)
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center);
+
+            f.render_widget(status_text, chunks[2]);
+
+            // Show cursor only in input mode
+            if input_mode {
+                f.set_cursor_position((chunks[1].x + 1 + input.width() as u16, chunks[1].y + 1));
+            }
+        })?;
+
+        // Handle input
+        if crossterm::event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = crossterm::event::read()? {
+                match (key.modifiers, key.code) {
+                    (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+
+                    (_, KeyCode::Tab) => {
+                        input_mode = !input_mode;
                     }
+
+                    (_, KeyCode::Enter) if input_mode && !input.trim().is_empty() => {
+                        // Add user message
+                        message_effects.push(MessageEffect::new(Message {
+                            role: "user".to_string(),
+                            content: input.clone(),
+                            timestamp: Utc::now(),
+                        }));
+
+                        // Add assistant response
+                        message_effects.push(MessageEffect::new(Message {
+                            role: "assistant".to_string(),
+                            content: format!("You said: {}", input),
+                            timestamp: Utc::now(),
+                        }));
+
+                        input.clear();
+                    }
+
+                    (_, KeyCode::Backspace) if input_mode => {
+                        input.pop();
+                    }
+
+                    (_, KeyCode::Char(c)) if input_mode => {
+                        input.push(c);
+                    }
+
+                    _ => {}
                 }
             }
         }
-
-        // Exit the loop if the state is Quit
-        if app.state == AppState::Quit {
-            break;
-        }
     }
+
+    // Clean up
+    crossterm::terminal::disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
 
     Ok(())
-}
-
-/// Draws the user interface based on the current application state
-fn ui(f: &mut Frame<'_>, app: &App) {
-    // Define the overall layout with header, body, and footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(7), // Header
-                Constraint::Min(1),    // Body
-                Constraint::Length(3), // Footer
-            ]
-            .as_ref(),
-        )
-        .split(f.area());
-
-    // Draw header
-    draw_header(f, chunks[0]);
-
-    // Draw body based on state
-    match app.state {
-        AppState::MainMenu => draw_main_menu(f, chunks[1], app),
-        AppState::Chat => draw_chat(f, chunks[1], app),
-        AppState::BrowseIndex => draw_placeholder(f, chunks[1], "Browse Index"),
-        AppState::GitHubRecommendations => draw_placeholder(f, chunks[1], "GitHub Recommendations"),
-        AppState::Help => draw_placeholder(f, chunks[1], "Help"),
-        AppState::Settings => draw_placeholder(f, chunks[1], "Settings"),
-        AppState::QuitConfirm => draw_quit_confirm(f, chunks[1]),
-        AppState::SelectCodebase => {
-            // Render the directory tree
-            app.dir_tree.render(f, chunks[1]);
-        }
-        AppState::Quit => {}
-    }
-
-    // Draw footer
-    draw_footer(f, chunks[2], app);
 }
