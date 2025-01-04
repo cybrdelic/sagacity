@@ -13,10 +13,12 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
+use reqwest::Client;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -45,7 +47,7 @@ impl LogPanel {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            visible: false,
+            visible: true,
         }
     }
     fn add(&mut self, msg: impl Into<String>) {
@@ -58,28 +60,19 @@ impl LogPanel {
 
 struct App {
     screen: AppScreen,
-
-    // splash
     splash_selected_idx: usize,
     splash_menu_items: Vec<&'static str>,
-
-    // indexing
     tree: Vec<TreeNode>,
     indexing_done: bool,
     indexing_count: usize,
-
-    // chat
     chat_input: String,
-    chat_messages: Vec<(String, bool)>, // (message, is_user)
-
-    // logs
+    chat_messages: Vec<(String, bool)>,
     logs: LogPanel,
-
-    // spinner
     spinner_idx: usize,
-
-    // thinking
     chat_thinking: bool,
+    claude_client: Client,
+    conversation_history: Vec<Value>,
+    thinking_status: String,
 }
 
 impl App {
@@ -88,22 +81,20 @@ impl App {
             screen: AppScreen::Splash,
             splash_selected_idx: 0,
             splash_menu_items: vec!["start chat", "quit"],
-
             tree: vec![],
             indexing_done: false,
             indexing_count: 0,
-
             chat_input: String::new(),
             chat_messages: vec![],
-
             logs: LogPanel::new(),
             spinner_idx: 0,
             chat_thinking: false,
+            claude_client: Client::new(),
+            conversation_history: Vec::new(),
+            thinking_status: String::new(),
         }
     }
 }
-
-// -- drawing
 
 fn draw_ui(f: &mut Frame, app: &App) {
     match app.screen {
@@ -116,13 +107,11 @@ fn draw_ui(f: &mut Frame, app: &App) {
 fn draw_splash(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // horizontal split: 40% for ascii, 60% for menu
     let hsplit = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(size);
 
-    // the ascii block
     let ascii_art = r"
 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
 ██ ▄▀▄ █ ██ █ ▄▄▀█▀ ██ ▄▄▀█ ▄▀████ ▄▄▀██▄█
@@ -132,25 +121,18 @@ fn draw_splash(f: &mut Frame, app: &App) {
 An Intelligent Software Development Copilot
     ";
 
-    // create the paragraph
     let ascii_par = Paragraph::new(ascii_art)
         .alignment(Alignment::Center)
         .block(Block::default())
         .wrap(Wrap { trim: true });
 
-    // now do a vertical layout in the left chunk to center that ascii vertically
     let ascii_vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40), // top filler
-            Constraint::Percentage(60), // bottom filler
-        ])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(hsplit[0]);
 
-    // we draw ascii in the middle
     f.render_widget(ascii_par, ascii_vert[1]);
 
-    // the menu block
     let mut menu_lines = Vec::new();
     for (i, item) in app.splash_menu_items.iter().enumerate() {
         let selected = i == app.splash_selected_idx;
@@ -170,20 +152,17 @@ An Intelligent Software Development Copilot
         .alignment(Alignment::Center)
         .block(Block::default());
 
-    // let's say we have exactly app.splash_menu_items.len() lines
     let menu_line_count = app.splash_menu_items.len() as u16;
 
-    // now do a vertical layout in the right chunk to center that menu vertically
     let menu_vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(50),          // top filler
-            Constraint::Length(menu_line_count), // actual menu lines
-            Constraint::Percentage(50),          // bottom filler
+            Constraint::Percentage(50),
+            Constraint::Length(menu_line_count),
+            Constraint::Percentage(50),
         ])
         .split(hsplit[1]);
 
-    // draw the menu in the middle
     f.render_widget(menu_par, menu_vert[1]);
 }
 
@@ -191,10 +170,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     let size = f.area();
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 2), // left: tree
-            Constraint::Ratio(1, 2), // right: logs
-        ])
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(size);
 
     let left_split = Layout::default()
@@ -206,7 +182,6 @@ fn draw_indexing(f: &mut Frame, app: &App) {
         ])
         .split(main_chunks[0]);
 
-    // top status
     let spinner_frames = ["-", "\\", "|", "/"];
     let spin_char = spinner_frames[app.spinner_idx % spinner_frames.len()];
     let indexing_status = if app.indexing_done {
@@ -229,7 +204,6 @@ fn draw_indexing(f: &mut Frame, app: &App) {
         .alignment(Alignment::Left);
     f.render_widget(top_para, left_split[0]);
 
-    // middle: show tree nodes
     let mut lines = Vec::new();
     for (i, node) in app.tree.iter().enumerate() {
         let bar_len: usize = 20;
@@ -257,7 +231,6 @@ fn draw_indexing(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true });
     f.render_widget(tree_para, left_split[1]);
 
-    // bottom overall progress
     let total_files = app.tree.len() as f32;
     let mut total_progress = 0.0;
     for node in &app.tree {
@@ -286,96 +259,292 @@ fn draw_indexing(f: &mut Frame, app: &App) {
 
 fn draw_chat(f: &mut Frame, app: &App) {
     let size = f.area();
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
+
+    // First split screen horizontally into chat and logs sections
+    let horizontal_chunks = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(4, 5),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Ratio(2, 3), // Main chat area (2/3 of screen)
+            Constraint::Ratio(1, 3), // Logs area (1/3 of screen)
         ])
+        .margin(1) // Add margin around entire UI
         .split(size);
 
-    // chat msgs
-    let chat_block = Block::default()
-        .title(" chat ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(chat_block.clone(), main_chunks[0]);
-    let chat_area = chat_block.inner(main_chunks[0]);
+    // Split the chat section vertically for messages, status, and input
+    let chat_vertical_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // Messages area (takes remaining space)
+            Constraint::Length(2), // Status bar (2 lines: 1 for separator, 1 for status)
+            Constraint::Length(8), // Input area (6 lines for text, 2 for separators)
+        ])
+        .split(horizontal_chunks[0]);
 
+    let messages_area = chat_vertical_chunks[0];
+
+    // Render chat messages
     let mut lines = Vec::new();
     for (msg, from_user) in &app.chat_messages {
-        let prefix = if *from_user { "user: " } else { "assistant: " };
-        let color = if *from_user {
+        // Add spacing between messages
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        let style = Style::default().fg(if *from_user {
             Color::Yellow
         } else {
             Color::Green
-        };
+        });
+
+        // Process the message content
+        let indent = if *from_user { "  " } else { "" };
+
+        // Add message start
         lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(msg),
+            Span::styled(indent, style),
+            Span::styled("│ ", style),
+        ]));
+
+        // Split and process message by lines
+        let mut in_code_block = false;
+        let mut code_buffer = String::new();
+        let mut text_buffer = String::new();
+
+        for line in msg.lines() {
+            if line.trim().starts_with("```") {
+                // Process any accumulated text before switching modes
+                if !text_buffer.is_empty() {
+                    // Wrap and add accumulated text
+                    let wrapped = textwrap::wrap(
+                        &text_buffer,
+                        messages_area.width.saturating_sub(4) as usize,
+                    );
+                    for line in wrapped {
+                        lines.push(Line::from(vec![
+                            Span::styled(indent, style),
+                            Span::styled("│ ", style),
+                            Span::styled(line.to_string(), style),
+                        ]));
+                    }
+                    text_buffer.clear();
+                }
+
+                // Process any accumulated code before switching modes
+                if !code_buffer.is_empty() {
+                    // Add accumulated code
+                    for code_line in code_buffer.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(indent, style),
+                            Span::styled("│ ", style),
+                            Span::styled("▎", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!(" {}", code_line),
+                                Style::default().fg(Color::Rgb(209, 154, 102)),
+                            ),
+                        ]));
+                    }
+                    code_buffer.clear();
+                }
+
+                in_code_block = !in_code_block;
+                continue;
+            }
+
+            if in_code_block {
+                code_buffer.push_str(line);
+                code_buffer.push('\n');
+            } else {
+                text_buffer.push_str(line);
+                text_buffer.push('\n');
+            }
+        }
+
+        // Process any remaining text
+        if !text_buffer.is_empty() {
+            let wrapped =
+                textwrap::wrap(&text_buffer, messages_area.width.saturating_sub(4) as usize);
+            for line in wrapped {
+                lines.push(Line::from(vec![
+                    Span::styled(indent, style),
+                    Span::styled("│ ", style),
+                    Span::styled(line.to_string(), style),
+                ]));
+            }
+        }
+
+        // Process any remaining code
+        if !code_buffer.is_empty() {
+            for code_line in code_buffer.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled(indent, style),
+                    Span::styled("│ ", style),
+                    Span::styled("▎", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(" {}", code_line),
+                        Style::default().fg(Color::Rgb(209, 154, 102)),
+                    ),
+                ]));
+            }
+        }
+
+        // Add message end
+        lines.push(Line::from(vec![
+            Span::styled(indent, style),
+            Span::styled("╰─", style),
         ]));
     }
-    let msgs_para = Paragraph::new(lines).wrap(Wrap { trim: true });
-    f.render_widget(msgs_para, chat_area);
 
-    // chat status
-    let thinking_line = if app.chat_thinking {
-        "assistant is thinking..."
-    } else {
-        ""
-    };
-    let status_para = Paragraph::new(thinking_line)
-        .style(Style::default().fg(Color::Blue))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(" assistant status ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
-    f.render_widget(status_para, main_chunks[1]);
-
-    // chat input
-    let input_block = Block::default()
-        .title(" input ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::White));
-    f.render_widget(input_block.clone(), main_chunks[2]);
-    let input_area = input_block.inner(main_chunks[2]);
-
-    let inp_para = Paragraph::new(app.chat_input.as_str())
-        .style(Style::default().fg(Color::White))
+    // Create message area with scrolling
+    let msgs_para = Paragraph::new(lines.clone())
+        .style(Style::default())
+        .block(Block::default())
         .wrap(Wrap { trim: true });
-    f.render_widget(inp_para, input_area);
 
-    let cursor_x = input_area.x + app.chat_input.len() as u16 + 1;
-    let cursor_y = input_area.y;
-    f.set_cursor_position((cursor_x, cursor_y));
+    // Calculate total height needed
+    let total_lines = lines.len() as u16;
+    let available_height = messages_area.height;
 
-    // logs if visible overlay
-    if app.logs.visible {
-        let logs_rect = Rect {
-            x: size.width.saturating_sub(size.width / 3),
-            y: 0,
-            width: size.width / 3,
-            height: size.height,
-        };
-        draw_logs_panel(f, &app.logs, logs_rect);
-    }
+    // Calculate scroll offset to always show the most recent messages
+    let scroll_offset = total_lines.saturating_sub(available_height);
+    f.render_widget(msgs_para.scroll((scroll_offset, 0)), messages_area);
+
+    // Draw status bar with spinner
+    let spinner_frames = ["◐", "◓", "◑", "◒"];
+    let thinking_indicator = if app.chat_thinking {
+        spinner_frames[app.spinner_idx % spinner_frames.len()]
+    } else {
+        " "
+    };
+
+    let status = Line::from(vec![
+        Span::styled(thinking_indicator, Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(
+            if app.chat_thinking {
+                &app.thinking_status
+            } else {
+                ""
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let status_area = chat_vertical_chunks[1];
+    f.render_widget(
+        Paragraph::new(status).alignment(Alignment::Left),
+        Rect {
+            x: status_area.x,
+            y: status_area.y + 1,
+            width: status_area.width,
+            height: 1,
+        },
+    );
+
+    // Draw input area
+    let input_area = chat_vertical_chunks[2];
+
+    // Top separator
+    let separator = "─".repeat(input_area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &separator,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            x: input_area.x,
+            y: input_area.y,
+            width: input_area.width,
+            height: 1,
+        },
+    );
+
+    // Input text
+    let input = Line::from(vec![
+        Span::styled("→ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.chat_input, Style::default().fg(Color::White)),
+    ]);
+
+    let visible_width = input_area.width.saturating_sub(2);
+    let text_width = app.chat_input.len() as u16;
+    let scroll_offset = if text_width > visible_width {
+        text_width - visible_width
+    } else {
+        0
+    };
+
+    f.render_widget(
+        Paragraph::new(input).scroll((0, scroll_offset)),
+        Rect {
+            x: input_area.x,
+            y: input_area.y + 1,
+            width: input_area.width,
+            height: input_area.height - 2,
+        },
+    );
+
+    // Bottom separator
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &separator,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            x: input_area.x,
+            y: input_area.y + input_area.height - 1,
+            width: input_area.width,
+            height: 1,
+        },
+    );
+
+    // Set cursor position
+    let cursor_x = input_area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
+    f.set_cursor_position((cursor_x, input_area.y + 1));
+
+    // Draw logs area
+    let log_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // Log messages
+            Constraint::Length(8), // Align with input area
+        ])
+        .split(horizontal_chunks[1]);
+
+    // Vertical separator
+    let vsep = "│".repeat(size.height as usize - 2);
+    f.render_widget(
+        Paragraph::new(vsep).style(Style::default().fg(Color::DarkGray)),
+        Rect {
+            x: horizontal_chunks[1].x - 1,
+            y: 1,
+            width: 1,
+            height: size.height - 2,
+        },
+    );
+
+    // Logs
+    let log_lines: Vec<Line> = app
+        .logs
+        .entries
+        .iter()
+        .map(|entry| {
+            Line::from(vec![
+                Span::styled("• ", Style::default().fg(Color::DarkGray)),
+                Span::raw(entry),
+            ])
+        })
+        .collect();
+
+    let logs_para = Paragraph::new(log_lines)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
+
+    let log_scroll = (app.logs.entries.len() as u16).saturating_sub(log_chunks[0].height);
+    f.render_widget(logs_para.scroll((log_scroll, 0)), log_chunks[0]);
 }
-
-// logs
-
 fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
     let logs_block = Block::default()
         .title(" logs ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
-    // do .inner before we move logs_block
     let inner = logs_block.inner(area);
     f.render_widget(logs_block, area);
 
@@ -389,7 +558,6 @@ fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
     f.render_widget(para, inner);
 }
 
-// helper
 async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
@@ -445,37 +613,100 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
     }
 }
 
+async fn get_claude_response(
+    user_input: &str,
+    history: &[Value],
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+    let url = "https://api.anthropic.com/v1/messages";
+
+    let mut messages = history.to_vec();
+    messages.push(json!({
+        "role": "user",
+        "content": user_input
+    }));
+
+    let payload = json!({
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 1024,
+        "messages": messages,
+        "temperature": 0.7
+    });
+
+    let client = Client::new();
+    let response = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&payload)
+        .send()
+        .await?;
+
+    let response_data: Value = response.json().await?;
+
+    let content = response_data["content"][0]["text"]
+        .as_str()
+        .unwrap_or("Sorry, I couldn't process that request.")
+        .to_string();
+
+    Ok(content)
+}
+
 async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
+    // Set initial state
     {
         let mut guard = app.lock().await;
         guard.chat_thinking = true;
-        guard
-            .logs
-            .add(format!("assistant thinking about '{user_input}'..."));
+        guard.chat_input.clear();
+        guard.chat_messages.push((user_input.clone(), true));
+        guard.logs.add("Sending to Claude 3.5...");
+        guard.thinking_status = "Claude 3.5 thinking...".to_string();
     }
-    sleep(Duration::from_secs(2)).await;
+
+    // Get conversation history without holding the lock
+    let history = {
+        let guard = app.lock().await;
+        guard.conversation_history.clone()
+    };
+
+    // Make API call without holding the mutex lock
+    let response = match get_claude_response(&user_input, &history).await {
+        Ok(response) => {
+            let mut guard = app.lock().await;
+            guard.logs.add("Response received from Claude");
+            response
+        }
+        Err(e) => {
+            let mut guard = app.lock().await;
+            guard.logs.add(format!("Error from Claude: {}", e));
+            "I apologize, but I encountered an error processing your request.".to_string()
+        }
+    };
+
+    // Update final state and conversation history
     {
         let mut guard = app.lock().await;
+        // Update conversation history
+        guard.conversation_history.push(json!({
+            "role": "user",
+            "content": user_input
+        }));
+        guard.conversation_history.push(json!({
+            "role": "assistant",
+            "content": response.clone()
+        }));
+        guard.chat_messages.push((response, false));
         guard.chat_thinking = false;
-        guard
-            .chat_messages
-            .push((format!("response to '{user_input}'"), false));
-        guard
-            .logs
-            .add(format!("assistant responded to '{user_input}'"));
+        guard.thinking_status = String::new(); // Clear the thinking status
+        guard.logs.add("Claude response complete");
     }
 }
 
-// center ascii in chunk
-fn center_in_rect(chunk: Rect, _ascii: &str) -> Rect {
-    // just return chunk for now or do something fancier
-    chunk
-}
-
-// -- main
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Initialize environment
+    dotenv::dotenv().ok();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -487,14 +718,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     'outer: loop {
         {
-            // draw
             let mut guard = app.lock().await;
             guard.spinner_idx = guard.spinner_idx.wrapping_add(1);
             terminal.draw(|f| {
                 draw_ui(f, &guard);
             })?;
         }
-        // input
+
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(ke) => {
@@ -534,17 +764,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
                             }
-                            (KeyModifiers::NONE, KeyCode::Char('l')) => {
-                                guard.logs.visible = !guard.logs.visible;
-                            }
                             _ => {}
                         },
                         AppScreen::Chat => match (ke.modifiers, ke.code) {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
-                            }
-                            (KeyModifiers::NONE, KeyCode::Char('l')) => {
-                                guard.logs.visible = !guard.logs.visible;
                             }
                             (KeyModifiers::NONE, KeyCode::Enter) => {
                                 let input_text = guard.chat_input.clone();
@@ -555,8 +779,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     tokio::spawn(async move {
                                         simulate_chat_response(clone, input_text).await;
                                     });
-                                } else {
-                                    guard.chat_input.clear();
                                 }
                             }
                             (KeyModifiers::NONE, KeyCode::Backspace) => {
@@ -565,7 +787,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
                                 guard.chat_input.push(c);
                             }
-
                             _ => {}
                         },
                     }
