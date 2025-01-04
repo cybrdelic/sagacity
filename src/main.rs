@@ -653,12 +653,12 @@ async fn get_claude_response(
 }
 
 async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
-    // Set initial state
+    // Set initial state - REMOVED duplicating the user message here
     {
         let mut guard = app.lock().await;
         guard.chat_thinking = true;
         guard.chat_input.clear();
-        guard.chat_messages.push((user_input.clone(), true));
+        // Removed: guard.chat_messages.push((user_input.clone(), true));  // This was causing duplication
         guard.logs.add("Sending to Claude 3.5...");
         guard.thinking_status = "Claude 3.5 thinking...".to_string();
     }
