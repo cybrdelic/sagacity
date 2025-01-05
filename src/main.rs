@@ -25,6 +25,9 @@ use std::sync::Arc;
 use textwrap::wrap;
 use tokio::sync::Mutex;
 
+mod status_indicator;
+use status_indicator::StatusIndicator;
+
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -102,7 +105,7 @@ struct App {
     spinner_idx: usize,
     chat_thinking: bool,
     chatbot: Chatbot,
-    thinking_status: String,
+    status_indicator: StatusIndicator,
     indexing_start_time: Option<SystemTime>,
     chat_scroll: u16,
     logs_scroll: u16,
@@ -126,7 +129,7 @@ impl App {
             spinner_idx: 0,
             chat_thinking: false,
             chatbot,
-            thinking_status: String::new(),
+            status_indicator: StatusIndicator::new(),
             indexing_start_time: None,
             chat_scroll: 0,
             logs_scroll: 0,
@@ -134,7 +137,7 @@ impl App {
     }
 }
 
-fn draw_ui(f: &mut Frame, app: &App) {
+fn draw_ui(f: &mut Frame, app: &mut App) {
     match app.screen {
         AppScreen::Splash => draw_splash(f, app),
         AppScreen::Indexing => draw_indexing(f, app),
@@ -142,7 +145,7 @@ fn draw_ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_splash(f: &mut Frame, app: &App) {
+fn draw_splash(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     let hsplit = Layout::default()
@@ -204,7 +207,7 @@ An Intelligent Software Development Copilot
     f.render_widget(menu_par, menu_vert[1]);
 }
 
-fn draw_indexing(f: &mut Frame, app: &App) {
+fn draw_indexing(f: &mut Frame, app: &mut App) {
     let size = f.area();
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -321,7 +324,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     f.render_widget(logs_para, inner_logs_area);
 }
 
-fn draw_chat(f: &mut Frame, app: &App) {
+fn draw_chat(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     let horizontal_chunks = Layout::default()
@@ -462,36 +465,9 @@ fn draw_chat(f: &mut Frame, app: &App) {
 
     f.render_widget(msgs_para.scroll((chat_scroll, 0)), messages_area);
 
-    let spinner_frames = ["◐", "◓", "◑", "◒"];
-    let thinking_indicator = if app.chat_thinking {
-        spinner_frames[app.spinner_idx % spinner_frames.len()]
-    } else {
-        " "
-    };
-
-    let status = Line::from(vec![
-        Span::styled(thinking_indicator, Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-        Span::styled(
-            if app.chat_thinking {
-                &app.thinking_status
-            } else {
-                ""
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-
-    let status_area = chat_vertical_chunks[1];
-    f.render_widget(
-        Paragraph::new(status).alignment(Alignment::Left),
-        Rect {
-            x: status_area.x,
-            y: status_area.y + 1,
-            width: status_area.width,
-            height: 1,
-        },
-    );
+    // Update and render status indicator
+    app.status_indicator.update_spinner();
+    app.status_indicator.render(f, chat_vertical_chunks[1]);
 
     let input_area = chat_vertical_chunks[2];
     let separator = "─".repeat(input_area.width as usize);
@@ -664,7 +640,8 @@ async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         guard.chat_thinking = true;
         guard.chat_input.clear();
         guard.logs.add("Processing query...");
-        guard.thinking_status = "Thinking...".to_string();
+        guard.status_indicator.set_thinking(true);
+        guard.status_indicator.set_status("Thinking...");
     }
 
     let context = {
@@ -698,7 +675,8 @@ async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         let mut guard = app.lock().await;
         guard.chat_messages.push((response, false));
         guard.chat_thinking = false;
-        guard.thinking_status = String::new();
+        guard.status_indicator.set_thinking(false);
+        guard.status_indicator.set_status("");
         guard.logs.add("Response complete");
     }
 }
@@ -756,7 +734,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut guard = app.lock().await;
             guard.spinner_idx = guard.spinner_idx.wrapping_add(1);
             terminal.draw(|f| {
-                draw_ui(f, &guard);
+                draw_ui(f, &mut guard);
             })?;
         }
 
