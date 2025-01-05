@@ -20,8 +20,21 @@ use ratatui::{
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use textwrap::wrap;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+/// Add the following dependencies to your `Cargo.toml`:
+/// ```toml
+/// [dependencies]
+/// crossterm = "0.26"
+/// ratatui = "0.29"
+/// reqwest = { version = "0.11", features = ["json", "tokio-runtime"] }
+/// serde_json = "1.0"
+/// tokio = { version = "1.28", features = ["full"] }
+/// dotenv = "0.15"
+/// textwrap = "0.15"
+/// ```
 
 #[derive(Clone, Debug)]
 struct TreeNode {
@@ -58,6 +71,7 @@ impl LogPanel {
     }
 }
 
+#[derive(Debug)]
 struct App {
     screen: AppScreen,
     splash_selected_idx: usize,
@@ -73,6 +87,10 @@ struct App {
     claude_client: Client,
     conversation_history: Vec<Value>,
     thinking_status: String,
+
+    // New fields for scroll positions
+    chat_scroll: u16,
+    logs_scroll: u16,
 }
 
 impl App {
@@ -92,6 +110,10 @@ impl App {
             claude_client: Client::new(),
             conversation_history: Vec::new(),
             thinking_status: String::new(),
+
+            // Initialize scroll positions
+            chat_scroll: 0,
+            logs_scroll: 0,
         }
     }
 }
@@ -112,14 +134,14 @@ fn draw_splash(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(size);
 
-    let ascii_art = r"
+    let ascii_art = r#"
 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
 ██ ▄▀▄ █ ██ █ ▄▄▀█▀ ██ ▄▄▀█ ▄▀████ ▄▄▀██▄█
 ██ █ █ █ ▀▀ █ ▀▀▄██ ██ ▀▀ █ █ █▀▀█ ▀▀ ██ ▄
 ██ ███ █▀▀▀▄█▄█▄▄█▀ ▀█▄██▄█▄▄██▄▄█▄██▄█▄▄▄
 ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 An Intelligent Software Development Copilot
-    ";
+    "#;
 
     let ascii_par = Paragraph::new(ascii_art)
         .alignment(Alignment::Center)
@@ -260,7 +282,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
 fn draw_chat(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // First split screen horizontally into chat and logs sections
+    // Split screen horizontally into chat and logs sections
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -276,7 +298,7 @@ fn draw_chat(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Min(1),    // Messages area (takes remaining space)
             Constraint::Length(2), // Status bar (2 lines: 1 for separator, 1 for status)
-            Constraint::Length(8), // Input area (6 lines for text, 2 for separators)
+            Constraint::Length(3), // Input area (1 line for text, 2 for separators)
         ])
         .split(horizontal_chunks[0]);
 
@@ -315,15 +337,15 @@ fn draw_chat(f: &mut Frame, app: &App) {
                 // Process any accumulated text before switching modes
                 if !text_buffer.is_empty() {
                     // Wrap and add accumulated text
-                    let wrapped = textwrap::wrap(
+                    let wrapped = wrap(
                         &text_buffer,
-                        messages_area.width.saturating_sub(4) as usize,
+                        (messages_area.width as usize).saturating_sub(4),
                     );
-                    for line in wrapped {
+                    for wrapped_line in wrapped {
                         lines.push(Line::from(vec![
                             Span::styled(indent, style),
                             Span::styled("│ ", style),
-                            Span::styled(line.to_string(), style),
+                            Span::styled(wrapped_line.to_string(), style),
                         ]));
                     }
                     text_buffer.clear();
@@ -361,13 +383,15 @@ fn draw_chat(f: &mut Frame, app: &App) {
 
         // Process any remaining text
         if !text_buffer.is_empty() {
-            let wrapped =
-                textwrap::wrap(&text_buffer, messages_area.width.saturating_sub(4) as usize);
-            for line in wrapped {
+            let wrapped = wrap(
+                &text_buffer,
+                (messages_area.width as usize).saturating_sub(4),
+            );
+            for wrapped_line in wrapped {
                 lines.push(Line::from(vec![
                     Span::styled(indent, style),
                     Span::styled("│ ", style),
-                    Span::styled(line.to_string(), style),
+                    Span::styled(wrapped_line.to_string(), style),
                 ]));
             }
         }
@@ -394,19 +418,29 @@ fn draw_chat(f: &mut Frame, app: &App) {
         ]));
     }
 
-    // Create message area with scrolling
-    let msgs_para = Paragraph::new(lines.clone())
+    // Calculate total lines and available height
+    let total_lines = lines.len() as u16;
+    let available_height = messages_area.height;
+
+    // Ensure scroll offset is within bounds
+    let max_scroll = if total_lines > available_height {
+        total_lines - available_height
+    } else {
+        0
+    };
+    let chat_scroll = if app.chat_scroll > max_scroll {
+        max_scroll
+    } else {
+        app.chat_scroll
+    };
+
+    // Render the messages with scrolling
+    let msgs_para = Paragraph::new(lines)
         .style(Style::default())
         .block(Block::default())
         .wrap(Wrap { trim: true });
 
-    // Calculate total height needed
-    let total_lines = lines.len() as u16;
-    let available_height = messages_area.height;
-
-    // Calculate scroll offset to always show the most recent messages
-    let scroll_offset = total_lines.saturating_sub(available_height);
-    f.render_widget(msgs_para.scroll((scroll_offset, 0)), messages_area);
+    f.render_widget(msgs_para.scroll((chat_scroll, 0)), messages_area);
 
     // Draw status bar with spinner
     let spinner_frames = ["◐", "◓", "◑", "◒"];
@@ -533,13 +567,30 @@ fn draw_chat(f: &mut Frame, app: &App) {
         })
         .collect();
 
+    // Calculate total lines and available height for logs
+    let total_log_lines = log_lines.len() as u16;
+    let log_available_height = log_chunks[0].height;
+
+    // Ensure logs_scroll is within bounds
+    let max_log_scroll = if total_log_lines > log_available_height {
+        total_log_lines - log_available_height
+    } else {
+        0
+    };
+    let logs_scroll = if app.logs_scroll > max_log_scroll {
+        max_log_scroll
+    } else {
+        app.logs_scroll
+    };
+
+    // Render logs with scrolling
     let logs_para = Paragraph::new(log_lines)
         .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
 
-    let log_scroll = (app.logs.entries.len() as u16).saturating_sub(log_chunks[0].height);
-    f.render_widget(logs_para.scroll((log_scroll, 0)), log_chunks[0]);
+    f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
 }
+
 fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
     let logs_block = Block::default()
         .title(" logs ")
@@ -587,7 +638,7 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
             let node = guard.tree.get_mut(idx).unwrap();
             node.status = "indexing".into();
             let fname = node.filename.clone();
-            guard.logs.add(format!("indexing {fname}"));
+            guard.logs.add(format!("indexing {}", fname));
         }
         for _ in 0..10 {
             {
@@ -653,12 +704,11 @@ async fn get_claude_response(
 }
 
 async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
-    // Set initial state - REMOVED duplicating the user message here
+    // Set initial state
     {
         let mut guard = app.lock().await;
         guard.chat_thinking = true;
         guard.chat_input.clear();
-        // Removed: guard.chat_messages.push((user_input.clone(), true));  // This was causing duplication
         guard.logs.add("Sending to Claude 3.5...");
         guard.thinking_status = "Claude 3.5 thinking...".to_string();
     }
@@ -787,6 +837,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
                                 guard.chat_input.push(c);
                             }
+                            // Scroll Up in Chat Messages
+                            (KeyModifiers::NONE, KeyCode::Up) => {
+                                if guard.chat_scroll > 0 {
+                                    guard.chat_scroll -= 1;
+                                }
+                            }
+                            // Scroll Down in Chat Messages
+                            (KeyModifiers::NONE, KeyCode::Down) => {
+                                guard.chat_scroll += 1;
+                            }
+                            // Scroll Page Up in Chat Messages
+                            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                                guard.chat_scroll = guard.chat_scroll.saturating_sub(10);
+                            }
+                            // Scroll Page Down in Chat Messages
+                            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                                guard.chat_scroll += 10;
+                            }
+                            // Optionally, you can add separate keys for scrolling logs
                             _ => {}
                         },
                     }
