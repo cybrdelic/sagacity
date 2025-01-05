@@ -276,6 +276,43 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
     f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
 }
 
+/// Parses markdown text into ratatui::text::Spans
+fn parse_markdown(text: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::all());
+
+    let mut bold = false;
+    let mut italic = false;
+
+    for event in parser {
+        match event {
+            pulldown_cmark::Event::Start(tag) => match tag {
+                pulldown_cmark::Tag::Emphasis => italic = true,
+                pulldown_cmark::Tag::Strong => bold = true,
+                _ => {}
+            },
+            pulldown_cmark::Event::End(tag) => match tag {
+                pulldown_cmark::TagEnd::Emphasis => italic = false,
+                pulldown_cmark::TagEnd::Strong => bold = false,
+                _ => {}
+            },
+            pulldown_cmark::Event::Text(text) => {
+                let mut style = Style::default();
+                if bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                spans.push(Span::styled(text.to_string(), style));
+            }
+            _ => {}
+        }
+    }
+
+    spans
+}
+
 /// Handles the simulation of chat responses.
 pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
     {
