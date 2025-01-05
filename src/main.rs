@@ -3,7 +3,7 @@ use std::{
     env,
     error::Error,
     io::{self},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crossterm::{
@@ -24,7 +24,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use textwrap::wrap;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -34,6 +33,16 @@ struct TreeNode {
     filename: String,
     progress: f32,
     status: String,
+}
+
+impl TreeNode {
+    fn new(filename: String) -> Self {
+        Self {
+            filename,
+            progress: 0.0,
+            status: "pending".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +73,6 @@ impl LogPanel {
     }
 }
 
-// Add Chatbot structure for managing indexed content
 #[derive(Debug)]
 struct Chatbot {
     index: HashMap<String, (String, String)>,
@@ -95,8 +103,7 @@ struct App {
     chat_thinking: bool,
     chatbot: Chatbot,
     thinking_status: String,
-
-    // Scroll positions
+    indexing_start_time: Option<SystemTime>,
     chat_scroll: u16,
     logs_scroll: u16,
 }
@@ -120,6 +127,7 @@ impl App {
             chat_thinking: false,
             chatbot,
             thinking_status: String::new(),
+            indexing_start_time: None,
             chat_scroll: 0,
             logs_scroll: 0,
         }
@@ -206,28 +214,37 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     let left_split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(main_chunks[0]);
 
-    let spinner_frames = ["-", "\\", "|", "/"];
+    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spin_char = spinner_frames[app.spinner_idx % spinner_frames.len()];
-    let indexing_status = if app.indexing_done {
-        "complete!"
-    } else {
-        "indexing..."
-    };
+
+    let elapsed = app
+        .indexing_start_time
+        .map(|start| start.elapsed().unwrap_or_default())
+        .unwrap_or_default();
+
     let top_line = format!(
-        "status: {} {}  (files processed: {})",
-        spin_char, indexing_status, app.indexing_count
+        "Status: {} {}  ({} files)\nElapsed: {}s",
+        spin_char,
+        if app.indexing_done {
+            "Complete!"
+        } else {
+            "Indexing..."
+        },
+        app.indexing_count,
+        elapsed.as_secs()
     );
+
     let top_para = Paragraph::new(top_line)
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .title(" indexing status ")
+                .title(" Status ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::White)),
         )
@@ -238,9 +255,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     for (i, node) in app.tree.iter().enumerate() {
         let bar_len: usize = 20;
         let filled = (node.progress * bar_len as f32).round() as usize;
-        let filled_str = "#".repeat(filled);
-        let empty_str = " ".repeat(bar_len.saturating_sub(filled));
-        let bar = format!("[{}{}]", filled_str, empty_str);
+        let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_len - filled));
         let line_str = format!(
             "{}. {} ({}%)  {} [{}]",
             i + 1,
@@ -254,7 +269,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     let tree_para = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" indexing files ")
+                .title(" Files ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
@@ -274,21 +289,20 @@ fn draw_indexing(f: &mut Frame, app: &App) {
     let bar_len: usize = 30;
     let filled = (overall * bar_len as f32).round() as usize;
     let empty = bar_len.saturating_sub(filled);
-    let final_bar = format!("[{}{}]", "#".repeat(filled), " ".repeat(empty));
-    let bot_line = format!("overall progress: {:.1}%  {}", overall * 100.0, final_bar);
+    let final_bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
+    let bot_line = format!("Overall progress: {:.1}%  {}", overall * 100.0, final_bar);
     let bot_para = Paragraph::new(bot_line)
         .block(
             Block::default()
-                .title(" overall progress ")
+                .title(" Progress ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .alignment(Alignment::Left);
     f.render_widget(bot_para, left_split[2]);
 
-    // Draw logs panel on the right
     let logs_block = Block::default()
-        .title(" logs ")
+        .title(" Logs ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
@@ -530,20 +544,15 @@ fn draw_chat(f: &mut Frame, app: &App) {
             height: 1,
         },
     );
-    // Set cursor position
+
     let cursor_x = input_area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
     f.set_cursor_position((cursor_x, input_area.y + 1));
 
-    // Draw logs area
     let log_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // Log messages
-            Constraint::Length(8), // Align with input area
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(8)])
         .split(horizontal_chunks[1]);
 
-    // Vertical separator
     let vsep = "│".repeat(size.height as usize - 2);
     f.render_widget(
         Paragraph::new(vsep).style(Style::default().fg(Color::DarkGray)),
@@ -555,7 +564,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
         },
     );
 
-    // Logs
     let log_lines: Vec<Line> = app
         .logs
         .entries
@@ -568,11 +576,9 @@ fn draw_chat(f: &mut Frame, app: &App) {
         })
         .collect();
 
-    // Calculate total lines and available height for logs
     let total_log_lines = log_lines.len() as u16;
     let log_available_height = log_chunks[0].height;
 
-    // Ensure logs_scroll is within bounds
     let max_log_scroll = if total_log_lines > log_available_height {
         total_log_lines - log_available_height
     } else {
@@ -584,7 +590,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
         app.logs_scroll
     };
 
-    // Render logs with scrolling
     let logs_para = Paragraph::new(log_lines)
         .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
@@ -594,7 +599,7 @@ fn draw_chat(f: &mut Frame, app: &App) {
 
 fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
     let logs_block = Block::default()
-        .title(" logs ")
+        .title(" Logs ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
     let inner = logs_block.inner(area);
@@ -613,15 +618,11 @@ fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
 async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
-        guard.logs.add("starting codebase indexing...");
-        guard.tree = vec![TreeNode {
-            filename: "src/main.rs".into(),
-            progress: 0.0,
-            status: "pending".into(),
-        }];
+        guard.logs.add("Starting codebase indexing...");
+        guard.indexing_start_time = Some(SystemTime::now());
+        guard.tree = vec![TreeNode::new("src/main.rs".into())];
     }
 
-    // Get API key
     let api_key = {
         let guard = app.lock().await;
         guard.chatbot.api_key.clone()
@@ -630,7 +631,7 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
     let main_rs = "src/main.rs";
     {
         let mut guard = app.lock().await;
-        guard.logs.add("indexing main.rs...");
+        guard.logs.add("Indexing main.rs...");
     }
 
     if let Ok(content) = std::fs::read_to_string(main_rs) {
@@ -640,7 +641,7 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
                 .chatbot
                 .index
                 .insert(main_rs.to_string(), (summary, "rust".to_string()));
-            guard.logs.add("indexed main.rs successfully");
+            guard.logs.add("Indexed main.rs successfully");
 
             let node = guard.tree.get_mut(0).unwrap();
             node.progress = 1.0;
@@ -652,7 +653,7 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
         guard.indexing_done = true;
-        guard.logs.add("indexing complete!");
+        guard.logs.add("Indexing complete!");
         guard.screen = AppScreen::Chat;
     }
 }
@@ -666,7 +667,6 @@ async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         guard.thinking_status = "Thinking...".to_string();
     }
 
-    // Create context from indexed files
     let context = {
         let guard = app.lock().await;
         let mut ctx = String::new();
@@ -734,36 +734,6 @@ async fn get_claude_response(
     let response_data: Value = response.json().await?;
     Ok(response_data["content"][0]["text"]
         .as_str()
-        .unwrap_or("Sorry, I couldn't process that request.")
-        .to_string())
-}
-
-async fn summarize_file(
-    content: &str,
-    language: &str,
-    api_key: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let client = Client::new();
-    let prompt = format!(
-        "Please analyze this {} code and provide a brief summary of its purpose and functionality.\n\nCode:\n{}",
-        language, content
-    );
-
-    let response = client
-        .post(CLAUDE_API_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .json(&json!({
-            "model": "claude-3-opus-20240229",
-            "max_tokens": 1024,
-            "messages": [{ "role": "user", "content": prompt }]
-        }))
-        .send()
-        .await?;
-
-    let body: Value = response.json().await?;
-    Ok(body["content"][0]["text"]
-        .as_str()
         .unwrap_or_default()
         .to_string())
 }
@@ -829,6 +799,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
                             }
+                            (KeyModifiers::NONE, KeyCode::Esc) => {
+                                guard.logs.add("Indexing cancelled by user");
+                                guard.screen = AppScreen::Chat;
+                            }
                             _ => {}
                         },
                         AppScreen::Chat => match (key.modifiers, key.code) {
@@ -879,4 +853,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+async fn summarize_file(
+    content: &str,
+    language: &str,
+    api_key: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let client = Client::new();
+    let prompt = format!(
+        "Please analyze this {} code and provide a brief summary of its purpose and functionality.\n\nCode:\n{}",
+        language, content
+    );
+
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-opus-20240229",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": prompt }]
+        }))
+        .send()
+        .await?;
+
+    let body: Value = response.json().await?;
+    Ok(body["content"][0]["text"]
+        .as_str()
+        .unwrap_or("Sorry, I couldn't process that request.")
+        .to_string())
 }
