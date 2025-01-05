@@ -3,6 +3,7 @@ use std::{
     env,
     error::Error,
     io::{self},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -14,18 +15,19 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use textwrap::wrap;
 use tokio::sync::Mutex;
 
+mod splash_screen;
 mod status_indicator;
+use splash_screen::{SplashScreen, SplashScreenAction};
 use status_indicator::StatusIndicator;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -94,8 +96,7 @@ impl Chatbot {
 #[derive(Debug)]
 struct App {
     screen: AppScreen,
-    splash_selected_idx: usize,
-    splash_menu_items: Vec<&'static str>,
+    splash_screen: SplashScreen,
     tree: Vec<TreeNode>,
     indexing_done: bool,
     indexing_count: usize,
@@ -118,8 +119,7 @@ impl App {
 
         Self {
             screen: AppScreen::Splash,
-            splash_selected_idx: 0,
-            splash_menu_items: vec!["start chat", "quit"],
+            splash_screen: SplashScreen::new(),
             tree: vec![],
             indexing_done: false,
             indexing_count: 0,
@@ -139,72 +139,10 @@ impl App {
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
     match app.screen {
-        AppScreen::Splash => draw_splash(f, app),
+        AppScreen::Splash => app.splash_screen.draw(f, f.size()),
         AppScreen::Indexing => draw_indexing(f, app),
         AppScreen::Chat => draw_chat(f, app),
     }
-}
-
-fn draw_splash(f: &mut Frame, app: &mut App) {
-    let size = f.area();
-
-    let hsplit = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(size);
-
-    let ascii_art = r#"
-▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-██ ▄▀▄ █ ██ █ ▄▄▀█▀ ██ ▄▄▀█ ▄▀████ ▄▄▀██▄█
-██ █ █ █ ▀▀ █ ▀▀▄██ ██ ▀▀ █ █ █▀▀█ ▀▀ ██ ▄
-██ ███ █▀▀▀▄█▄█▄▄█▀ ▀█▄██▄█▄▄██▄▄█▄██▄█▄▄▄
-▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-An Intelligent Software Development Copilot
-    "#;
-
-    let ascii_par = Paragraph::new(ascii_art)
-        .alignment(Alignment::Center)
-        .block(Block::default())
-        .wrap(Wrap { trim: true });
-
-    let ascii_vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(hsplit[0]);
-
-    f.render_widget(ascii_par, ascii_vert[1]);
-
-    let mut menu_lines = Vec::new();
-    for (i, item) in app.splash_menu_items.iter().enumerate() {
-        let selected = i == app.splash_selected_idx;
-        let style = if selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        menu_lines.push(Line::from(Span::styled(
-            format!("{} {}", if selected { "▶" } else { " " }, item),
-            style,
-        )));
-    }
-    let menu_par = Paragraph::new(menu_lines)
-        .alignment(Alignment::Center)
-        .block(Block::default());
-
-    let menu_line_count = app.splash_menu_items.len() as u16;
-
-    let menu_vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Length(menu_line_count),
-            Constraint::Percentage(50),
-        ])
-        .split(hsplit[1]);
-
-    f.render_widget(menu_par, menu_vert[1]);
 }
 
 fn draw_indexing(f: &mut Frame, app: &mut App) {
@@ -314,13 +252,12 @@ fn draw_indexing(f: &mut Frame, app: &mut App) {
 
     let mut log_lines = Vec::new();
     for entry in &app.logs.entries {
-        log_lines.push(Line::from(vec![Span::raw(entry)]));
+        log_lines.push(Line::from(Span::raw(entry)));
     }
 
     let logs_para = Paragraph::new(log_lines)
         .wrap(Wrap { trim: true })
         .scroll((app.logs_scroll, 0));
-
     f.render_widget(logs_para, inner_logs_area);
 }
 
@@ -465,7 +402,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
 
     f.render_widget(msgs_para.scroll((chat_scroll, 0)), messages_area);
 
-    // Update and render status indicator
     app.status_indicator.update_spinner();
     app.status_indicator.render(f, chat_vertical_chunks[1]);
 
@@ -571,24 +507,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
-}
-
-fn draw_logs_panel(f: &mut Frame, logs: &LogPanel, area: Rect) {
-    let logs_block = Block::default()
-        .title(" Logs ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-    let inner = logs_block.inner(area);
-    f.render_widget(logs_block, area);
-
-    let mut lines = Vec::new();
-    for l in &logs.entries {
-        lines.push(Line::from(vec![Span::raw(l)]));
-    }
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .alignment(Alignment::Left);
-    f.render_widget(para, inner);
 }
 
 async fn indexing_task(app: Arc<Mutex<App>>) {
@@ -743,36 +661,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Event::Key(key) => {
                     let mut guard = app.lock().await;
                     match guard.screen {
-                        AppScreen::Splash => match (key.modifiers, key.code) {
-                            (KeyModifiers::NONE, KeyCode::Down) => {
-                                guard.splash_selected_idx =
-                                    (guard.splash_selected_idx + 1) % guard.splash_menu_items.len();
-                            }
-                            (KeyModifiers::NONE, KeyCode::Up) => {
-                                guard.splash_selected_idx = if guard.splash_selected_idx == 0 {
-                                    guard.splash_menu_items.len() - 1
-                                } else {
-                                    guard.splash_selected_idx - 1
-                                };
-                            }
-                            (KeyModifiers::NONE, KeyCode::Enter) => {
-                                let selected = guard.splash_menu_items[guard.splash_selected_idx];
-                                if selected == "quit" {
-                                    break 'outer;
-                                } else {
-                                    guard.screen = AppScreen::Indexing;
-                                    let clone = app.clone();
-                                    drop(guard);
-                                    tokio::spawn(async move {
-                                        indexing_task(clone).await;
-                                    });
+                        AppScreen::Splash => {
+                            if let Some(action) = guard.splash_screen.handle_input(key) {
+                                match action {
+                                    SplashScreenAction::Quit => break 'outer,
+                                    SplashScreenAction::StartChat => {
+                                        guard.screen = AppScreen::Indexing;
+                                        let clone = app.clone();
+                                        drop(guard);
+                                        tokio::spawn(async move {
+                                            indexing_task(clone).await;
+                                        });
+                                    }
                                 }
                             }
-                            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                                break 'outer;
-                            }
-                            _ => {}
-                        },
+                        }
                         AppScreen::Indexing => match (key.modifiers, key.code) {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
