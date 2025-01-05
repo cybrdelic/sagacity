@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    env,
     error::Error,
     io::{self},
     time::Duration,
@@ -24,17 +26,8 @@ use textwrap::wrap;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-/// Add the following dependencies to your `Cargo.toml`:
-/// ```toml
-/// [dependencies]
-/// crossterm = "0.26"
-/// ratatui = "0.29"
-/// reqwest = { version = "0.11", features = ["json", "tokio-runtime"] }
-/// serde_json = "1.0"
-/// tokio = { version = "1.28", features = ["full"] }
-/// dotenv = "0.15"
-/// textwrap = "0.15"
-/// ```
+const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 #[derive(Clone, Debug)]
 struct TreeNode {
@@ -71,6 +64,22 @@ impl LogPanel {
     }
 }
 
+// Add Chatbot structure for managing indexed content
+#[derive(Debug)]
+struct Chatbot {
+    index: HashMap<String, (String, String)>,
+    api_key: String,
+}
+
+impl Chatbot {
+    fn new(api_key: String) -> Self {
+        Self {
+            index: HashMap::new(),
+            api_key,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct App {
     screen: AppScreen,
@@ -84,17 +93,19 @@ struct App {
     logs: LogPanel,
     spinner_idx: usize,
     chat_thinking: bool,
-    claude_client: Client,
-    conversation_history: Vec<Value>,
+    chatbot: Chatbot,
     thinking_status: String,
 
-    // New fields for scroll positions
+    // Scroll positions
     chat_scroll: u16,
     logs_scroll: u16,
 }
 
 impl App {
     fn new() -> Self {
+        let api_key = env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let chatbot = Chatbot::new(api_key);
+
         Self {
             screen: AppScreen::Splash,
             splash_selected_idx: 0,
@@ -107,11 +118,8 @@ impl App {
             logs: LogPanel::new(),
             spinner_idx: 0,
             chat_thinking: false,
-            claude_client: Client::new(),
-            conversation_history: Vec::new(),
+            chatbot,
             thinking_status: String::new(),
-
-            // Initialize scroll positions
             chat_scroll: 0,
             logs_scroll: 0,
         }
@@ -160,7 +168,7 @@ An Intelligent Software Development Copilot
         let selected = i == app.splash_selected_idx;
         let style = if selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
@@ -221,7 +229,7 @@ fn draw_indexing(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" indexing status ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(Color::White)),
         )
         .alignment(Alignment::Left);
     f.render_widget(top_para, left_split[0]);
@@ -277,37 +285,50 @@ fn draw_indexing(f: &mut Frame, app: &App) {
         )
         .alignment(Alignment::Left);
     f.render_widget(bot_para, left_split[2]);
+
+    // Draw logs panel on the right
+    let logs_block = Block::default()
+        .title(" logs ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner_logs_area = logs_block.inner(main_chunks[1]);
+    f.render_widget(logs_block, main_chunks[1]);
+
+    let mut log_lines = Vec::new();
+    for entry in &app.logs.entries {
+        log_lines.push(Line::from(vec![Span::raw(entry)]));
+    }
+
+    let logs_para = Paragraph::new(log_lines)
+        .wrap(Wrap { trim: true })
+        .scroll((app.logs_scroll, 0));
+
+    f.render_widget(logs_para, inner_logs_area);
 }
 
 fn draw_chat(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // Split screen horizontally into chat and logs sections
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(2, 3), // Main chat area (2/3 of screen)
-            Constraint::Ratio(1, 3), // Logs area (1/3 of screen)
-        ])
-        .margin(1) // Add margin around entire UI
+        .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
+        .margin(1)
         .split(size);
 
-    // Split the chat section vertically for messages, status, and input
     let chat_vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),    // Messages area (takes remaining space)
-            Constraint::Length(2), // Status bar (2 lines: 1 for separator, 1 for status)
-            Constraint::Length(3), // Input area (1 line for text, 2 for separators)
+            Constraint::Min(1),
+            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(horizontal_chunks[0]);
 
     let messages_area = chat_vertical_chunks[0];
 
-    // Render chat messages
     let mut lines = Vec::new();
     for (msg, from_user) in &app.chat_messages {
-        // Add spacing between messages
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
@@ -318,25 +339,19 @@ fn draw_chat(f: &mut Frame, app: &App) {
             Color::Green
         });
 
-        // Process the message content
         let indent = if *from_user { "  " } else { "" };
-
-        // Add message start
         lines.push(Line::from(vec![
             Span::styled(indent, style),
             Span::styled("│ ", style),
         ]));
 
-        // Split and process message by lines
         let mut in_code_block = false;
         let mut code_buffer = String::new();
         let mut text_buffer = String::new();
 
         for line in msg.lines() {
             if line.trim().starts_with("```") {
-                // Process any accumulated text before switching modes
                 if !text_buffer.is_empty() {
-                    // Wrap and add accumulated text
                     let wrapped = wrap(
                         &text_buffer,
                         (messages_area.width as usize).saturating_sub(4),
@@ -351,9 +366,7 @@ fn draw_chat(f: &mut Frame, app: &App) {
                     text_buffer.clear();
                 }
 
-                // Process any accumulated code before switching modes
                 if !code_buffer.is_empty() {
-                    // Add accumulated code
                     for code_line in code_buffer.lines() {
                         lines.push(Line::from(vec![
                             Span::styled(indent, style),
@@ -381,7 +394,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
             }
         }
 
-        // Process any remaining text
         if !text_buffer.is_empty() {
             let wrapped = wrap(
                 &text_buffer,
@@ -396,7 +408,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
             }
         }
 
-        // Process any remaining code
         if !code_buffer.is_empty() {
             for code_line in code_buffer.lines() {
                 lines.push(Line::from(vec![
@@ -411,18 +422,14 @@ fn draw_chat(f: &mut Frame, app: &App) {
             }
         }
 
-        // Add message end
         lines.push(Line::from(vec![
             Span::styled(indent, style),
             Span::styled("╰─", style),
         ]));
     }
 
-    // Calculate total lines and available height
     let total_lines = lines.len() as u16;
     let available_height = messages_area.height;
-
-    // Ensure scroll offset is within bounds
     let max_scroll = if total_lines > available_height {
         total_lines - available_height
     } else {
@@ -434,7 +441,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
         app.chat_scroll
     };
 
-    // Render the messages with scrolling
     let msgs_para = Paragraph::new(lines)
         .style(Style::default())
         .block(Block::default())
@@ -442,7 +448,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
 
     f.render_widget(msgs_para.scroll((chat_scroll, 0)), messages_area);
 
-    // Draw status bar with spinner
     let spinner_frames = ["◐", "◓", "◑", "◒"];
     let thinking_indicator = if app.chat_thinking {
         spinner_frames[app.spinner_idx % spinner_frames.len()]
@@ -462,6 +467,7 @@ fn draw_chat(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
+
     let status_area = chat_vertical_chunks[1];
     f.render_widget(
         Paragraph::new(status).alignment(Alignment::Left),
@@ -473,11 +479,9 @@ fn draw_chat(f: &mut Frame, app: &App) {
         },
     );
 
-    // Draw input area
     let input_area = chat_vertical_chunks[2];
-
-    // Top separator
     let separator = "─".repeat(input_area.width as usize);
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             &separator,
@@ -491,7 +495,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
         },
     );
 
-    // Input text
     let input = Line::from(vec![
         Span::styled("→ ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.chat_input, Style::default().fg(Color::White)),
@@ -515,7 +518,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
         },
     );
 
-    // Bottom separator
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             &separator,
@@ -528,7 +530,6 @@ fn draw_chat(f: &mut Frame, app: &App) {
             height: 1,
         },
     );
-
     // Set cursor position
     let cursor_x = input_area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
     f.set_cursor_position((cursor_x, input_area.y + 1));
@@ -613,44 +614,36 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
         guard.logs.add("starting codebase indexing...");
-        guard.tree = vec![
-            TreeNode {
-                filename: "src/main.rs".into(),
-                progress: 0.0,
-                status: "pending".into(),
-            },
-            TreeNode {
-                filename: "src/lib.rs".into(),
-                progress: 0.0,
-                status: "pending".into(),
-            },
-            TreeNode {
-                filename: "Cargo.toml".into(),
-                progress: 0.0,
-                status: "pending".into(),
-            },
-        ];
+        guard.tree = vec![TreeNode {
+            filename: "src/main.rs".into(),
+            progress: 0.0,
+            status: "pending".into(),
+        }];
     }
 
-    for idx in 0..3 {
-        {
+    // Get API key
+    let api_key = {
+        let guard = app.lock().await;
+        guard.chatbot.api_key.clone()
+    };
+
+    let main_rs = "src/main.rs";
+    {
+        let mut guard = app.lock().await;
+        guard.logs.add("indexing main.rs...");
+    }
+
+    if let Ok(content) = std::fs::read_to_string(main_rs) {
+        if let Ok(summary) = summarize_file(&content, "rust", &api_key).await {
             let mut guard = app.lock().await;
-            let node = guard.tree.get_mut(idx).unwrap();
-            node.status = "indexing".into();
-            let fname = node.filename.clone();
-            guard.logs.add(format!("indexing {}", fname));
-        }
-        for _ in 0..10 {
-            {
-                let mut guard = app.lock().await;
-                let node = guard.tree.get_mut(idx).unwrap();
-                node.progress += 0.1;
-            }
-            sleep(Duration::from_millis(150)).await;
-        }
-        {
-            let mut guard = app.lock().await;
-            let node = guard.tree.get_mut(idx).unwrap();
+            guard
+                .chatbot
+                .index
+                .insert(main_rs.to_string(), (summary, "rust".to_string()));
+            guard.logs.add("indexed main.rs successfully");
+
+            let node = guard.tree.get_mut(0).unwrap();
+            node.progress = 1.0;
             node.status = "done".into();
             guard.indexing_count += 1;
         }
@@ -664,12 +657,57 @@ async fn indexing_task(app: Arc<Mutex<App>>) {
     }
 }
 
+async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
+    {
+        let mut guard = app.lock().await;
+        guard.chat_thinking = true;
+        guard.chat_input.clear();
+        guard.logs.add("Processing query...");
+        guard.thinking_status = "Thinking...".to_string();
+    }
+
+    // Create context from indexed files
+    let context = {
+        let guard = app.lock().await;
+        let mut ctx = String::new();
+        for (file, (summary, _)) in &guard.chatbot.index {
+            ctx.push_str(&format!("File: {}\nSummary: {}\n\n", file, summary));
+        }
+        ctx
+    };
+
+    let prompt = format!(
+        "Based on this codebase context:\n{}\n\nAnswer this question: {}",
+        context, user_input
+    );
+
+    let response = match get_claude_response(&prompt, &[]).await {
+        Ok(response) => {
+            let mut guard = app.lock().await;
+            guard.logs.add("Response received");
+            response
+        }
+        Err(e) => {
+            let mut guard = app.lock().await;
+            guard.logs.add(format!("Error: {}", e));
+            "I encountered an error processing your request.".to_string()
+        }
+    };
+
+    {
+        let mut guard = app.lock().await;
+        guard.chat_messages.push((response, false));
+        guard.chat_thinking = false;
+        guard.thinking_status = String::new();
+        guard.logs.add("Response complete");
+    }
+}
+
 async fn get_claude_response(
     user_input: &str,
     history: &[Value],
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-    let url = "https://api.anthropic.com/v1/messages";
+    let api_key = env::var("ANTHROPIC_API_KEY")?;
 
     let mut messages = history.to_vec();
     messages.push(json!({
@@ -686,75 +724,52 @@ async fn get_claude_response(
 
     let client = Client::new();
     let response = client
-        .post(url)
+        .post(CLAUDE_API_URL)
         .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&payload)
         .send()
         .await?;
 
     let response_data: Value = response.json().await?;
-
-    let content = response_data["content"][0]["text"]
+    Ok(response_data["content"][0]["text"]
         .as_str()
         .unwrap_or("Sorry, I couldn't process that request.")
-        .to_string();
-
-    Ok(content)
+        .to_string())
 }
 
-async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
-    // Set initial state
-    {
-        let mut guard = app.lock().await;
-        guard.chat_thinking = true;
-        guard.chat_input.clear();
-        guard.logs.add("Sending to Claude 3.5...");
-        guard.thinking_status = "Claude 3.5 thinking...".to_string();
-    }
+async fn summarize_file(
+    content: &str,
+    language: &str,
+    api_key: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let client = Client::new();
+    let prompt = format!(
+        "Please analyze this {} code and provide a brief summary of its purpose and functionality.\n\nCode:\n{}",
+        language, content
+    );
 
-    // Get conversation history without holding the lock
-    let history = {
-        let guard = app.lock().await;
-        guard.conversation_history.clone()
-    };
+    let response = client
+        .post(CLAUDE_API_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&json!({
+            "model": "claude-3-opus-20240229",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": prompt }]
+        }))
+        .send()
+        .await?;
 
-    // Make API call without holding the mutex lock
-    let response = match get_claude_response(&user_input, &history).await {
-        Ok(response) => {
-            let mut guard = app.lock().await;
-            guard.logs.add("Response received from Claude");
-            response
-        }
-        Err(e) => {
-            let mut guard = app.lock().await;
-            guard.logs.add(format!("Error from Claude: {}", e));
-            "I apologize, but I encountered an error processing your request.".to_string()
-        }
-    };
-
-    // Update final state and conversation history
-    {
-        let mut guard = app.lock().await;
-        // Update conversation history
-        guard.conversation_history.push(json!({
-            "role": "user",
-            "content": user_input
-        }));
-        guard.conversation_history.push(json!({
-            "role": "assistant",
-            "content": response.clone()
-        }));
-        guard.chat_messages.push((response, false));
-        guard.chat_thinking = false;
-        guard.thinking_status = String::new(); // Clear the thinking status
-        guard.logs.add("Claude response complete");
-    }
+    let body: Value = response.json().await?;
+    Ok(body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Initialize environment
     dotenv::dotenv().ok();
 
     enable_raw_mode()?;
@@ -777,10 +792,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(ke) => {
+                Event::Key(key) => {
                     let mut guard = app.lock().await;
                     match guard.screen {
-                        AppScreen::Splash => match (ke.modifiers, ke.code) {
+                        AppScreen::Splash => match (key.modifiers, key.code) {
                             (KeyModifiers::NONE, KeyCode::Down) => {
                                 guard.splash_selected_idx =
                                     (guard.splash_selected_idx + 1) % guard.splash_menu_items.len();
@@ -810,13 +825,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             }
                             _ => {}
                         },
-                        AppScreen::Indexing => match (ke.modifiers, ke.code) {
+                        AppScreen::Indexing => match (key.modifiers, key.code) {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
                             }
                             _ => {}
                         },
-                        AppScreen::Chat => match (ke.modifiers, ke.code) {
+                        AppScreen::Chat => match (key.modifiers, key.code) {
                             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                                 break 'outer;
                             }
@@ -837,25 +852,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
                                 guard.chat_input.push(c);
                             }
-                            // Scroll Up in Chat Messages
                             (KeyModifiers::NONE, KeyCode::Up) => {
                                 if guard.chat_scroll > 0 {
                                     guard.chat_scroll -= 1;
                                 }
                             }
-                            // Scroll Down in Chat Messages
                             (KeyModifiers::NONE, KeyCode::Down) => {
                                 guard.chat_scroll += 1;
                             }
-                            // Scroll Page Up in Chat Messages
                             (KeyModifiers::NONE, KeyCode::PageUp) => {
                                 guard.chat_scroll = guard.chat_scroll.saturating_sub(10);
                             }
-                            // Scroll Page Down in Chat Messages
                             (KeyModifiers::NONE, KeyCode::PageDown) => {
                                 guard.chat_scroll += 10;
                             }
-                            // Optionally, you can add separate keys for scrolling logs
                             _ => {}
                         },
                     }
