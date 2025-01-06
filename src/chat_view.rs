@@ -1,9 +1,8 @@
 use std::{error::Error, sync::Arc};
 
-use crate::status_indicator::StatusIndicator;
-use crate::{App, Chatbot, LogPanel, TreeNode};
+use crate::App;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
@@ -11,24 +10,22 @@ use ratatui::{
 };
 use serde_json::{json, Value};
 use std::env::var;
-use textwrap::wrap;
 use tokio::sync::Mutex;
+
+use crate::chat_message::ChatMessage;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Renders the chat interface.
 pub fn draw_chat(f: &mut Frame, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
 
-    // Define the main horizontal layout: Chat area and Logs
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
         .margin(1)
         .split(size);
 
-    // Define the vertical layout within the Chat area: Messages, Status, Input
     let chat_vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -39,111 +36,34 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
         .split(horizontal_chunks[0]);
 
     let messages_area = chat_vertical_chunks[0];
+    draw_messages(f, app, messages_area);
 
-    // Prepare chat messages
+    // Render status indicator
+    app.status_indicator.update_spinner();
+    app.status_indicator.render(f, chat_vertical_chunks[1]);
+
+    // Render input area
+    draw_input(f, app, chat_vertical_chunks[2]);
+
+    // Render logs section
+    draw_logs(f, app, horizontal_chunks[1], size);
+}
+
+fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
+
     for (msg, from_user) in &app.chat_messages {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
 
-        let style = Style::default().fg(if *from_user {
-            Color::Yellow
-        } else {
-            Color::Green
-        });
-
-        let indent = if *from_user { "  " } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(indent, style),
-            Span::styled("│ ", style),
-        ]));
-
-        let mut in_code_block = false;
-        let mut code_buffer = String::new();
-        let mut text_buffer = String::new();
-
-        for line in msg.lines() {
-            if line.trim().starts_with("```") {
-                if !text_buffer.is_empty() {
-                    let wrapped = wrap(
-                        &text_buffer,
-                        (messages_area.width as usize).saturating_sub(4),
-                    );
-                    for wrapped_line in wrapped {
-                        lines.push(Line::from(vec![
-                            Span::styled(indent, style),
-                            Span::styled("│ ", style),
-                            Span::styled(wrapped_line.to_string(), style),
-                        ]));
-                    }
-                    text_buffer.clear();
-                }
-
-                if !code_buffer.is_empty() {
-                    for code_line in code_buffer.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled(indent, style),
-                            Span::styled("│ ", style),
-                            Span::styled("▎", Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                format!(" {}", code_line),
-                                Style::default().fg(Color::Rgb(209, 154, 102)),
-                            ),
-                        ]));
-                    }
-                    code_buffer.clear();
-                }
-
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                code_buffer.push_str(line);
-                code_buffer.push('\n');
-            } else {
-                text_buffer.push_str(line);
-                text_buffer.push('\n');
-            }
-        }
-
-        if !text_buffer.is_empty() {
-            let wrapped = wrap(
-                &text_buffer,
-                (messages_area.width as usize).saturating_sub(4),
-            );
-            for wrapped_line in wrapped {
-                lines.push(Line::from(vec![
-                    Span::styled(indent, style),
-                    Span::styled("│ ", style),
-                    Span::styled(wrapped_line.to_string(), style),
-                ]));
-            }
-        }
-
-        if !code_buffer.is_empty() {
-            for code_line in code_buffer.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled(indent, style),
-                    Span::styled("│ ", style),
-                    Span::styled("▎", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!(" {}", code_line),
-                        Style::default().fg(Color::Rgb(209, 154, 102)),
-                    ),
-                ]));
-            }
-        }
-
-        lines.push(Line::from(vec![
-            Span::styled(indent, style),
-            Span::styled("╰─", style),
-        ]));
+        let chat_message = ChatMessage::new(msg.clone(), *from_user);
+        let message_lines = chat_message.render(area);
+        lines.extend(message_lines);
     }
 
     let total_lines = lines.len() as u16;
-    let available_height = messages_area.height;
+    let available_height = area.height;
     let max_scroll = if total_lines > available_height {
         total_lines - available_height
     } else {
@@ -160,15 +80,11 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
         .block(Block::default())
         .wrap(Wrap { trim: true });
 
-    f.render_widget(msgs_para.scroll((chat_scroll, 0)), messages_area);
+    f.render_widget(msgs_para.scroll((chat_scroll, 0)), area);
+}
 
-    // Render the status indicator
-    app.status_indicator.update_spinner();
-    app.status_indicator.render(f, chat_vertical_chunks[1]);
-
-    // Render the input box
-    let input_area = chat_vertical_chunks[2];
-    let separator = "─".repeat(input_area.width as usize);
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+    let separator = "─".repeat(area.width as usize);
 
     // Top separator
     f.render_widget(
@@ -177,9 +93,9 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::DarkGray),
         ))),
         Rect {
-            x: input_area.x,
-            y: input_area.y,
-            width: input_area.width,
+            x: area.x,
+            y: area.y,
+            width: area.width,
             height: 1,
         },
     );
@@ -190,7 +106,7 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
         Span::styled(&app.chat_input, Style::default().fg(Color::White)),
     ]);
 
-    let visible_width = input_area.width.saturating_sub(2);
+    let visible_width = area.width.saturating_sub(2);
     let text_width = app.chat_input.len() as u16;
     let scroll_offset = if text_width > visible_width {
         text_width - visible_width
@@ -201,10 +117,10 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(input).scroll((0, scroll_offset)),
         Rect {
-            x: input_area.x,
-            y: input_area.y + 1,
-            width: input_area.width,
-            height: input_area.height - 2,
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height - 2,
         },
     );
 
@@ -215,28 +131,30 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::DarkGray),
         ))),
         Rect {
-            x: input_area.x,
-            y: input_area.y + input_area.height - 1,
-            width: input_area.width,
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
             height: 1,
         },
     );
 
     // Set cursor position
-    let cursor_x = input_area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
-    f.set_cursor_position((cursor_x, input_area.y + 1));
+    let cursor_x = area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
+    f.set_cursor_position((cursor_x, area.y + 1));
+}
 
-    // Render the Logs section
+fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
     let log_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(8)])
-        .split(horizontal_chunks[1]);
+        .split(area);
 
+    // Vertical separator
     let vsep = "│".repeat(size.height as usize - 2);
     f.render_widget(
         Paragraph::new(vsep).style(Style::default().fg(Color::DarkGray)),
         Rect {
-            x: horizontal_chunks[1].x - 1,
+            x: area.x - 1,
             y: 1,
             width: 1,
             height: size.height - 2,

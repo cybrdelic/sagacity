@@ -16,6 +16,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use tokio::sync::Mutex;
 
+mod chat_message;
 mod chat_view;
 mod indexing_view;
 mod models;
