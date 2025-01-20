@@ -52,13 +52,12 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
 fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
 
-    for (msg, from_user) in &app.chat_messages {
+    for (idx, message) in app.chat_messages.iter().enumerate() {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
 
-        let chat_message = ChatMessage::new(msg.clone(), *from_user);
-        let message_lines = chat_message.render(area);
+        let message_lines = message.render(area);
         lines.extend(message_lines);
     }
 
@@ -194,44 +193,6 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
     f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
 }
 
-/// Parses markdown text into ratatui::text::Spans
-fn parse_markdown(text: &str) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::all());
-
-    let mut bold = false;
-    let mut italic = false;
-
-    for event in parser {
-        match event {
-            pulldown_cmark::Event::Start(tag) => match tag {
-                pulldown_cmark::Tag::Emphasis => italic = true,
-                pulldown_cmark::Tag::Strong => bold = true,
-                _ => {}
-            },
-            pulldown_cmark::Event::End(tag) => match tag {
-                pulldown_cmark::TagEnd::Emphasis => italic = false,
-                pulldown_cmark::TagEnd::Strong => bold = false,
-                _ => {}
-            },
-            pulldown_cmark::Event::Text(text) => {
-                let mut style = Style::default();
-                if bold {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                if italic {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                spans.push(Span::styled(text.to_string(), style));
-            }
-            _ => {}
-        }
-    }
-
-    spans
-}
-
-/// Handles the simulation of chat responses.
 pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
     {
         let mut guard = app.lock().await;
@@ -256,34 +217,85 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         context, user_input
     );
 
-    let response = match get_claude_response(&prompt, &[]).await {
-        Ok(response) => {
+    {
+        let mut guard = app.lock().await;
+        guard.logs.add("Sending request to Claude API...");
+    }
+
+    match get_claude_response(&prompt, &[]).await {
+        Ok(response_data) => {
             let mut guard = app.lock().await;
-            guard.logs.add("Response received");
-            response
+            guard.logs.add("Response received from API");
+
+            if let Some(warning) = response_data.warning {
+                guard.logs.add(&format!("API Warning: {}", warning));
+            }
+
+            // Create a new ChatMessage for the response
+            let message = ChatMessage::new(response_data.content, false);
+            guard.chat_messages.push(message);
+
+            if let Some(usage) = response_data.usage {
+                guard.logs.add(&format!(
+                    "Tokens used - Input: {}, Output: {}, Total: {}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.input_tokens + usage.output_tokens
+                ));
+            }
         }
         Err(e) => {
             let mut guard = app.lock().await;
-            guard.logs.add(format!("Error: {}", e));
-            "I encountered an error processing your request.".to_string()
+            match e.downcast_ref::<reqwest::Error>() {
+                Some(req_err) => {
+                    if req_err.is_timeout() {
+                        guard.logs.add("Error: API request timed out");
+                    } else if req_err.is_connect() {
+                        guard.logs.add("Error: Could not connect to API");
+                    } else if let Some(status) = req_err.status() {
+                        guard
+                            .logs
+                            .add(&format!("API Error ({}): {}", status, req_err));
+                    } else {
+                        guard.logs.add(&format!("API Error: {}", req_err));
+                    }
+                }
+                None => guard.logs.add(&format!("Error: {}", e)),
+            }
+
+            guard.chat_messages.push(ChatMessage::new(
+                "I encountered an error processing your request.".to_string(),
+                false,
+            ));
         }
-    };
+    }
 
     {
         let mut guard = app.lock().await;
-        guard.chat_messages.push((response, false));
         guard.chat_thinking = false;
         guard.status_indicator.set_thinking(false);
         guard.status_indicator.set_status("");
-        guard.logs.add("Response complete");
+        guard.logs.add("Request complete");
     }
 }
 
-/// Sends a request to the Claude API and retrieves the response.
+#[derive(Debug)]
+pub struct ClaudeResponse {
+    pub content: String,
+    pub warning: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
 pub async fn get_claude_response(
     user_input: &str,
     history: &[Value],
-) -> Result<String, Box<dyn Error + Send + Sync>> {
+) -> Result<ClaudeResponse, Box<dyn Error + Send + Sync>> {
     let api_key = var("ANTHROPIC_API_KEY")?;
 
     let mut messages = history.to_vec();
@@ -309,13 +321,33 @@ pub async fn get_claude_response(
         .await?;
 
     let response_data: Value = response.json().await?;
-    Ok(response_data["content"][0]["text"]
+
+    let content = response_data["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
-        .to_string())
+        .to_string();
+
+    let warning = response_data["warning"].as_str().map(|s| s.to_string());
+
+    let usage = if let (Some(input), Some(output)) = (
+        response_data["usage"]["input_tokens"].as_u64(),
+        response_data["usage"]["output_tokens"].as_u64(),
+    ) {
+        Some(TokenUsage {
+            input_tokens: input as u32,
+            output_tokens: output as u32,
+        })
+    } else {
+        None
+    };
+
+    Ok(ClaudeResponse {
+        content,
+        warning,
+        usage,
+    })
 }
 
-/// Summarizes the content of a file using the Claude API.
 pub async fn summarize_file(
     content: &str,
     language: &str,
@@ -343,6 +375,16 @@ pub async fn summarize_file(
         .await?;
 
     let body: Value = response.json().await?;
+
+    if let Some(error) = body["error"].as_object() {
+        return Err(format!(
+            "API Error: {} - {}",
+            error["type"].as_str().unwrap_or("Unknown"),
+            error["message"].as_str().unwrap_or("No message")
+        )
+        .into());
+    }
+
     Ok(body["content"][0]["text"]
         .as_str()
         .unwrap_or("Sorry, I couldn't process that request.")
