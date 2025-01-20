@@ -1,240 +1,382 @@
-use chrono::{DateTime, Local};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::BorderType,
 };
-use textwrap::wrap;
-use unicode_width::UnicodeWidthStr;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
-    content: String,
-    from_user: bool,
-    timestamp: DateTime<Local>,
-    status: MessageStatus,
-    reactions: Vec<Reaction>,
+    pub content: String,
+    pub from_user: bool,
+    pub chunks: Vec<MessageChunk>,
+    pub focused_chunk: Option<usize>,
+    pub highlight_mode: bool,
+    language_colors: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
-pub enum MessageStatus {
-    Sending,
-    Sent,
-    Delivered,
-    Read,
-    Failed,
+pub struct MessageChunk {
+    pub id: usize,
+    pub content: ChunkType,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct Reaction {
-    emoji: String,
-    count: u32,
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChunkType {
+    Code(CodeSnippet),
+    Text(String),
+    Steps(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeSnippet {
+    pub id: usize,
+    pub content: String,
+    pub language: String,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+impl CodeSnippet {
+    pub fn new(
+        id: usize,
+        content: String,
+        language: String,
+        line_start: usize,
+        line_end: usize,
+    ) -> Self {
+        Self {
+            id,
+            content,
+            language,
+            line_start,
+            line_end,
+        }
+    }
+
+    pub fn detect_language(line: &str) -> String {
+        let clean_line = line.trim().trim_start_matches("```");
+        if clean_line.is_empty() {
+            "text".to_string()
+        } else {
+            clean_line.to_string()
+        }
+    }
 }
 
 impl ChatMessage {
     pub fn new(content: String, from_user: bool) -> Self {
-        Self {
-            content,
+        let mut msg = Self {
+            content: content.clone(),
             from_user,
-            timestamp: Local::now(),
-            status: MessageStatus::Sending,
-            reactions: Vec::new(),
+            chunks: Vec::new(),
+            focused_chunk: None,
+            highlight_mode: false,
+            language_colors: Self::default_language_colors(),
+        };
+        msg.parse_chunks();
+        msg
+    }
+
+    fn default_language_colors() -> HashMap<String, String> {
+        let mut colors = HashMap::new();
+        colors.insert("rust".to_string(), "#dea584".to_string());
+        colors.insert("python".to_string(), "#3572A5".to_string());
+        colors.insert("javascript".to_string(), "#f1e05a".to_string());
+        colors.insert("typescript".to_string(), "#2b7489".to_string());
+        colors.insert("go".to_string(), "#00ADD8".to_string());
+        colors
+    }
+
+    pub fn code_blocks(&self) -> impl Iterator<Item = &CodeSnippet> {
+        self.chunks.iter().filter_map(|chunk| {
+            if let ChunkType::Code(snippet) = &chunk.content {
+                Some(snippet)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn handle_esc_number(&self, number: usize) -> Option<String> {
+        let code_blocks: Vec<_> = self.code_blocks().collect();
+        if number > 0 && number <= code_blocks.len() {
+            Some(code_blocks[number - 1].content.clone())
+        } else {
+            None
         }
+    }
+
+    fn parse_chunks(&mut self) {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        let mut in_code_block = false;
+        let mut in_steps = false;
+        let mut current_steps = Vec::new();
+        let mut line_number = 0;
+        let mut chunk_start = 0;
+        let mut current_language = String::new();
+
+        for line in self.content.lines() {
+            line_number += 1;
+
+            if line.trim().starts_with("```") {
+                if !current_chunk.is_empty() && !in_code_block {
+                    chunks.push(MessageChunk {
+                        id: chunks.len(),
+                        content: ChunkType::Text(current_chunk.trim().to_string()),
+                        start_line: chunk_start,
+                        end_line: line_number - 1,
+                    });
+                    current_chunk.clear();
+                }
+
+                if in_code_block {
+                    chunks.push(MessageChunk {
+                        id: chunks.len(),
+                        content: ChunkType::Code(CodeSnippet::new(
+                            chunks.len(),
+                            current_chunk.trim().to_string(),
+                            current_language.clone(),
+                            chunk_start,
+                            line_number,
+                        )),
+                        start_line: chunk_start,
+                        end_line: line_number,
+                    });
+                    current_chunk.clear();
+                    current_language.clear();
+                    in_code_block = false;
+                } else {
+                    current_language = CodeSnippet::detect_language(line);
+                    in_code_block = true;
+                    chunk_start = line_number;
+                }
+                continue;
+            }
+
+            if line.trim().starts_with("1.") && !in_code_block {
+                if !current_chunk.is_empty() {
+                    chunks.push(MessageChunk {
+                        id: chunks.len(),
+                        content: ChunkType::Text(current_chunk.trim().to_string()),
+                        start_line: chunk_start,
+                        end_line: line_number - 1,
+                    });
+                    current_chunk.clear();
+                }
+                in_steps = true;
+                chunk_start = line_number;
+                current_steps.push(line.trim()[2..].trim().to_string());
+                continue;
+            }
+
+            if in_steps {
+                if line.trim().starts_with(char::is_numeric) {
+                    current_steps.push(line.trim()[2..].trim().to_string());
+                } else {
+                    chunks.push(MessageChunk {
+                        id: chunks.len(),
+                        content: ChunkType::Steps(current_steps.clone()),
+                        start_line: chunk_start,
+                        end_line: line_number - 1,
+                    });
+                    current_steps.clear();
+                    in_steps = false;
+                    chunk_start = line_number;
+                    current_chunk.push_str(line);
+                    current_chunk.push('\n');
+                }
+            } else if in_code_block {
+                current_chunk.push_str(line);
+                current_chunk.push('\n');
+            } else {
+                current_chunk.push_str(line);
+                current_chunk.push('\n');
+            }
+        }
+
+        if !current_chunk.is_empty() {
+            chunks.push(MessageChunk {
+                id: chunks.len(),
+                content: ChunkType::Text(current_chunk.trim().to_string()),
+                start_line: chunk_start,
+                end_line: line_number,
+            });
+        }
+
+        if in_steps && !current_steps.is_empty() {
+            chunks.push(MessageChunk {
+                id: chunks.len(),
+                content: ChunkType::Steps(current_steps),
+                start_line: chunk_start,
+                end_line: line_number,
+            });
+        }
+
+        self.chunks = chunks;
     }
 
     pub fn render(&self, area: Rect) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let base_style = self.get_base_style();
+        let style = self.get_base_style();
 
-        // Add header with timestamp and status
-        self.render_header(&mut lines, area, base_style);
+        self.render_header(&mut lines, style);
 
-        // Process message content
-        self.render_content(&mut lines, area, base_style);
+        for (idx, chunk) in self.chunks.iter().enumerate() {
+            let is_focused = self.focused_chunk == Some(idx);
+            self.render_chunk(&mut lines, chunk, is_focused, style, area);
+        }
 
-        // Add reactions if any
-        self.render_reactions(&mut lines, base_style);
-
-        // Add footer
-        self.render_footer(&mut lines, base_style);
+        self.render_footer(&mut lines, style);
 
         lines
     }
 
-    fn get_base_style(&self) -> Style {
-        let mut style = Style::default().fg(if self.from_user {
-            Color::Rgb(255, 223, 128) // Warmer yellow
-        } else {
-            Color::Rgb(144, 238, 144) // Softer green
-        });
-
-        match self.status {
-            MessageStatus::Failed => style = style.fg(Color::Red).add_modifier(Modifier::DIM),
-            MessageStatus::Sending => style = style.add_modifier(Modifier::DIM),
-            _ => {}
-        }
-
-        style
-    }
-
-    fn render_header(&self, lines: &mut Vec<Line<'static>>, area: Rect, style: Style) {
-        let timestamp = self.timestamp.format("%H:%M").to_string();
-        let status_icon = self.get_status_icon();
+    fn render_header(&self, lines: &mut Vec<Line<'static>>, style: Style) {
         let indent = if self.from_user { "  " } else { "" };
-
-        let header_line = Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(indent.to_string(), style),
             Span::styled("┌─".to_string(), style),
-            Span::styled(timestamp, style.add_modifier(Modifier::DIM)),
-            Span::styled(" ", style),
-            Span::styled(status_icon, style),
-        ]);
-
-        lines.push(header_line);
-    }
-
-    fn render_content(&self, lines: &mut Vec<Line<'static>>, area: Rect, style: Style) {
-        let indent = if self.from_user { "  " } else { "" };
-        let mut in_code_block = false;
-        let mut code_buffer = String::new();
-        let mut text_buffer = String::new();
-
-        for line in self.content.lines() {
-            if line.trim().starts_with("```") {
-                self.flush_text_buffer(lines, &text_buffer, area, style, indent);
-                self.flush_code_buffer(lines, &code_buffer, style, indent);
-                text_buffer.clear();
-                code_buffer.clear();
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                code_buffer.push_str(line);
-                code_buffer.push('\n');
-            } else {
-                text_buffer.push_str(line);
-                text_buffer.push('\n');
-            }
-        }
-
-        self.flush_text_buffer(lines, &text_buffer, area, style, indent);
-        self.flush_code_buffer(lines, &code_buffer, style, indent);
-    }
-
-    fn flush_text_buffer(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        buffer: &str,
-        area: Rect,
-        style: Style,
-        indent: &str,
-    ) {
-        if buffer.is_empty() {
-            return;
-        }
-
-        let wrap_width = (area.width as usize).saturating_sub(4);
-        let wrapped = wrap(buffer, wrap_width);
-
-        for wrapped_line in wrapped {
-            let line = Line::from(vec![
-                Span::styled(indent.to_string(), style),
-                Span::styled("│ ".to_string(), style),
-                Span::styled(wrapped_line.to_string(), style),
-            ]);
-            lines.push(line);
-        }
-    }
-
-    fn flush_code_buffer(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        buffer: &str,
-        style: Style,
-        indent: &str,
-    ) {
-        if buffer.is_empty() {
-            return;
-        }
-
-        let code_style = Style::default()
-            .fg(Color::Rgb(209, 154, 102))
-            .add_modifier(Modifier::BOLD);
-
-        for code_line in buffer.lines() {
-            let line = Line::from(vec![
-                Span::styled(indent.to_string(), style),
-                Span::styled("│ ".to_string(), style),
-                Span::styled("▎".to_string(), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {}", code_line), code_style),
-            ]);
-            lines.push(line);
-        }
-    }
-
-    fn render_reactions(&self, lines: &mut Vec<Line<'static>>, style: Style) {
-        if self.reactions.is_empty() {
-            return;
-        }
-
-        let indent = if self.from_user { "  " } else { "" };
-        let mut reaction_line = Vec::new();
-        reaction_line.push(Span::styled(indent.to_string(), style));
-        reaction_line.push(Span::styled("│ ".to_string(), style));
-
-        for (i, reaction) in self.reactions.iter().enumerate() {
-            if i > 0 {
-                reaction_line.push(Span::styled(" ", style));
-            }
-            reaction_line.push(Span::styled(
-                format!("{} {}", reaction.emoji, reaction.count),
-                style.add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        lines.push(Line::from(reaction_line));
+        ]));
     }
 
     fn render_footer(&self, lines: &mut Vec<Line<'static>>, style: Style) {
         let indent = if self.from_user { "  " } else { "" };
-        lines.push(Line::from(vec![
+        let mut footer_spans = vec![
             Span::styled(indent.to_string(), style),
             Span::styled("╰─".to_string(), style),
-        ]));
-    }
+        ];
 
-    fn get_status_icon(&self) -> String {
-        match self.status {
-            MessageStatus::Sending => "○".to_string(),
-            MessageStatus::Sent => "●".to_string(),
-            MessageStatus::Delivered => "✓".to_string(),
-            MessageStatus::Read => "✓✓".to_string(),
-            MessageStatus::Failed => "✗".to_string(),
-        }
-    }
-
-    // Public methods for interaction
-    pub fn set_status(&mut self, status: MessageStatus) {
-        self.status = status;
-    }
-
-    pub fn add_reaction(&mut self, emoji: String) {
-        if let Some(reaction) = self.reactions.iter_mut().find(|r| r.emoji == emoji) {
-            reaction.count += 1;
-        } else {
-            self.reactions.push(Reaction { emoji, count: 1 });
-        }
-    }
-
-    pub fn remove_reaction(&mut self, emoji: &str) {
-        if let Some(index) = self.reactions.iter().position(|r| r.emoji == emoji) {
-            let reaction = &mut self.reactions[index];
-            reaction.count -= 1;
-            if reaction.count == 0 {
-                self.reactions.remove(index);
+        if self.highlight_mode {
+            let code_blocks_count = self.code_blocks().count();
+            if code_blocks_count > 0 {
+                footer_spans.extend(vec![
+                    Span::styled(" [ESC+", style.add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        format!("1-{}", code_blocks_count),
+                        style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("] to copy", style.add_modifier(Modifier::DIM)),
+                ]);
             }
         }
+
+        lines.push(Line::from(footer_spans));
+    }
+
+    fn render_chunk(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        chunk: &MessageChunk,
+        is_focused: bool,
+        base_style: Style,
+        area: Rect,
+    ) {
+        let indent = if self.from_user { "  " } else { "" };
+
+        match &chunk.content {
+            ChunkType::Code(snippet) => {
+                let code_style = if is_focused {
+                    base_style.add_modifier(Modifier::REVERSED)
+                } else {
+                    base_style
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(indent.to_string(), base_style),
+                    Span::styled("│ ```", code_style),
+                    Span::styled(snippet.language.clone(), code_style),
+                ]));
+
+                for code_line in snippet.content.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("│ ", base_style),
+                        Span::styled(code_line.to_string(), code_style),
+                    ]));
+                }
+
+                lines.push(Line::from(vec![
+                    Span::styled(indent.to_string(), base_style),
+                    Span::styled("│ ```", code_style),
+                ]));
+            }
+            ChunkType::Text(text) => {
+                let text_style = if is_focused {
+                    base_style.add_modifier(Modifier::REVERSED)
+                } else {
+                    base_style
+                };
+
+                let wrap_width = (area.width as usize).saturating_sub(4);
+                let wrapped = textwrap::wrap(text, wrap_width);
+
+                for line in wrapped {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("│ ", base_style),
+                        Span::styled(line.to_string(), text_style),
+                    ]));
+                }
+            }
+            ChunkType::Steps(steps) => {
+                let step_style = if is_focused {
+                    base_style.add_modifier(Modifier::REVERSED)
+                } else {
+                    base_style
+                };
+
+                for (i, step) in steps.iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("│ ", base_style),
+                        Span::styled(format!("{}. ", i + 1), step_style),
+                        Span::styled(step.clone(), step_style),
+                    ]));
+                }
+            }
+        }
+    }
+
+    fn get_base_style(&self) -> Style {
+        Style::default().fg(if self.from_user {
+            Color::Rgb(255, 223, 128)
+        } else {
+            Color::Rgb(144, 238, 144)
+        })
+    }
+
+    pub fn focus_next(&mut self) {
+        match self.focused_chunk {
+            Some(current) if current + 1 < self.chunks.len() => {
+                self.focused_chunk = Some(current + 1);
+            }
+            None if !self.chunks.is_empty() => {
+                self.focused_chunk = Some(0);
+            }
+            _ => self.focused_chunk = None,
+        }
+    }
+
+    pub fn focus_previous(&mut self) {
+        match self.focused_chunk {
+            Some(current) if current > 0 => {
+                self.focused_chunk = Some(current - 1);
+            }
+            _ => self.focused_chunk = None,
+        }
+    }
+
+    pub fn get_focused_content(&self) -> Option<String> {
+        self.focused_chunk.and_then(|idx| {
+            self.chunks.get(idx).map(|chunk| match &chunk.content {
+                ChunkType::Code(snippet) => snippet.content.clone(),
+                ChunkType::Text(text) => text.clone(),
+                ChunkType::Steps(steps) => steps.join("\n"),
+            })
+        })
     }
 }
