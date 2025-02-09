@@ -1,0 +1,2 @@
+# Bug: Can't Scroll and Focus Messages at the Same Time
+When the user is in the chat_view.rs (after a few messages have filled up the verical viewport) - pressing the ```UP``` or ```DOWN``` keys causes a scroll. However, if at the top of the page, pressing these keys results in message focus mode starting. This means that any messages below the viewport are unable to be focused. It seems that the issue stems from not allowing scrolling and focusing to occur simulatenously, which should be happening in this case.
