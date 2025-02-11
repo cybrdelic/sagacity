@@ -1,23 +1,42 @@
 #!/bin/bash
-
-# Check if we're on macOS or Linux
+# determine the copy command based on os type
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    COPY_CMD="pbcopy"
+    copy_cmd="pbcopy"
 else
-    COPY_CMD="xclip -selection clipboard"
+    if ! command -v xclip &>/dev/null; then
+        echo "xclip not installed. install it rn and try again." >&2
+        exit 1
+    fi
+    copy_cmd="xclip -selection clipboard"
 fi
 
-# Find all .rs files, excluding the target and build directories
-find . -type f -name "*.rs" ! -path "./target/*" ! -path "./build/*" ! -path "./.git/*" | while read file; do
-    # Append the file contents to a temporary file
-    cat "$file" >> /tmp/all_rust_files_content.txt
-    echo -e "\n\n" >> /tmp/all_rust_files_content.txt  # Add spacing between files
+# create a temporary file for concatenated content
+tmp_file=$(mktemp /tmp/all_rust_files_content.XXXXXX.txt)
+
+# collect all .rs files, excluding target, build, and .git directories
+mapfile -t files < <(find . -type f -name "*.rs" ! -path "./target/*" ! -path "./build/*" ! -path "./.git/*")
+total=${#files[@]}
+
+if (( total == 0 )); then
+    echo "no rust files found. aborting."
+    exit 1
+fi
+
+echo -e "\n\033[1;32m✨ processing ${total} rust files...\033[0m\n"
+
+count=0
+for file in "${files[@]}"; do
+    count=$((count+1))
+    # print a fancy progress message with color and count
+    printf "\033[1;34m[%-3d/%-3d] processing: %s\033[0m\n" "$count" "$total" "$file"
+    echo -e "\n\n=== $file ===\n" >> "$tmp_file"
+    cat "$file" >> "$tmp_file"
+    echo -e "\n" >> "$tmp_file"
 done
 
-# Copy the contents of the temporary file to the clipboard
-cat /tmp/all_rust_files_content.txt | $COPY_CMD
+echo -e "\n\033[1;32m🚀 copying concatenated content to clipboard...\033[0m"
+cat "$tmp_file" | $copy_cmd
 
-# Clean up the temporary file
-rm /tmp/all_rust_files_content.txt
+rm "$tmp_file"
 
-echo "All Rust file contents have been copied to the clipboard."
+echo -e "\n\033[1;32m🎉 done. all rust file contents are now on your clipboard.\033[0m\n"
