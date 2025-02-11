@@ -41,7 +41,6 @@ impl StatusIndicator {
         } else {
             " "
         };
-
         let status = Line::from(vec![
             Span::styled(thinking_indicator, Style::default().fg(Color::Gray)),
             Span::raw(" "),
@@ -50,7 +49,6 @@ impl StatusIndicator {
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
-
         frame.render_widget(
             Paragraph::new(status).alignment(ratatui::layout::Alignment::Left),
             Rect {

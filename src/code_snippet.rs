@@ -51,7 +51,6 @@ impl SnippetManager {
         language_colors.insert("javascript".to_string(), "#f1e05a".to_string());
         language_colors.insert("typescript".to_string(), "#2b7489".to_string());
         language_colors.insert("go".to_string(), "#00ADD8".to_string());
-
         Self {
             snippets: Vec::new(),
             focused_snippet: None,
@@ -85,11 +84,9 @@ impl SnippetManager {
     pub fn focus_next(&mut self) {
         match self.focused_snippet {
             Some(current) if current + 1 < self.snippets.len() => {
-                self.focused_snippet = Some(current + 1);
+                self.focused_snippet = Some(current + 1)
             }
-            None if !self.snippets.is_empty() => {
-                self.focused_snippet = Some(0);
-            }
+            None if !self.snippets.is_empty() => self.focused_snippet = Some(0),
             _ => {}
         }
     }

@@ -121,7 +121,6 @@ impl ChatMessage {
 
         for line in self.content.lines() {
             line_number += 1;
-
             if line.trim().starts_with("```") {
                 if !current_chunk.is_empty() && !in_code_block {
                     chunks.push(MessageChunk {
@@ -132,7 +131,6 @@ impl ChatMessage {
                     });
                     current_chunk.clear();
                 }
-
                 if in_code_block {
                     chunks.push(MessageChunk {
                         id: chunks.len(),
@@ -156,7 +154,6 @@ impl ChatMessage {
                 }
                 continue;
             }
-
             if line.trim().starts_with("1.") && !in_code_block {
                 if !current_chunk.is_empty() {
                     chunks.push(MessageChunk {
@@ -172,7 +169,6 @@ impl ChatMessage {
                 current_steps.push(line.trim()[2..].trim().to_string());
                 continue;
             }
-
             if in_steps {
                 if line.trim().starts_with(char::is_numeric) {
                     current_steps.push(line.trim()[2..].trim().to_string());
@@ -197,7 +193,6 @@ impl ChatMessage {
                 current_chunk.push('\n');
             }
         }
-
         if !current_chunk.is_empty() {
             chunks.push(MessageChunk {
                 id: chunks.len(),
@@ -206,7 +201,6 @@ impl ChatMessage {
                 end_line: line_number,
             });
         }
-
         if in_steps && !current_steps.is_empty() {
             chunks.push(MessageChunk {
                 id: chunks.len(),
@@ -215,23 +209,18 @@ impl ChatMessage {
                 end_line: line_number,
             });
         }
-
         self.chunks = chunks;
     }
 
     pub fn render(&self, area: Rect) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let style = self.get_base_style();
-
         self.render_header(&mut lines, style);
-
         for (idx, chunk) in self.chunks.iter().enumerate() {
             let is_focused = self.focused_chunk == Some(idx);
             self.render_chunk(&mut lines, chunk, is_focused, style, area);
         }
-
         self.render_footer(&mut lines, style);
-
         lines
     }
 
@@ -249,7 +238,6 @@ impl ChatMessage {
             Span::styled(indent.to_string(), style),
             Span::styled("╰─".to_string(), style),
         ];
-
         if self.highlight_mode {
             let code_blocks_count = self.code_blocks().count();
             if code_blocks_count > 0 {
@@ -263,7 +251,6 @@ impl ChatMessage {
                 ]);
             }
         }
-
         lines.push(Line::from(footer_spans));
     }
 
@@ -276,7 +263,6 @@ impl ChatMessage {
         area: Rect,
     ) {
         let indent = if self.from_user { "  " } else { "" };
-
         match &chunk.content {
             ChunkType::Code(snippet) => {
                 let code_style = if is_focused {
@@ -284,13 +270,11 @@ impl ChatMessage {
                 } else {
                     base_style
                 };
-
                 lines.push(Line::from(vec![
                     Span::styled(indent.to_string(), base_style),
                     Span::styled("│ ```", code_style),
                     Span::styled(snippet.language.clone(), code_style),
                 ]));
-
                 for code_line in snippet.content.lines() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
@@ -298,7 +282,6 @@ impl ChatMessage {
                         Span::styled(code_line.to_string(), code_style),
                     ]));
                 }
-
                 lines.push(Line::from(vec![
                     Span::styled(indent.to_string(), base_style),
                     Span::styled("│ ```", code_style),
@@ -310,10 +293,8 @@ impl ChatMessage {
                 } else {
                     base_style
                 };
-
                 let wrap_width = (area.width as usize).saturating_sub(4);
                 let wrapped = textwrap::wrap(text, wrap_width);
-
                 for line in wrapped {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
@@ -328,7 +309,6 @@ impl ChatMessage {
                 } else {
                     base_style
                 };
-
                 for (i, step) in steps.iter().enumerate() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
@@ -352,20 +332,16 @@ impl ChatMessage {
     pub fn focus_next(&mut self) {
         match self.focused_chunk {
             Some(current) if current + 1 < self.chunks.len() => {
-                self.focused_chunk = Some(current + 1);
+                self.focused_chunk = Some(current + 1)
             }
-            None if !self.chunks.is_empty() => {
-                self.focused_chunk = Some(0);
-            }
+            None if !self.chunks.is_empty() => self.focused_chunk = Some(0),
             _ => self.focused_chunk = None,
         }
     }
 
     pub fn focus_previous(&mut self) {
         match self.focused_chunk {
-            Some(current) if current > 0 => {
-                self.focused_chunk = Some(current - 1);
-            }
+            Some(current) if current > 0 => self.focused_chunk = Some(current - 1),
             _ => self.focused_chunk = None,
         }
     }

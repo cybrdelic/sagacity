@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 
@@ -22,7 +22,6 @@ impl SplashScreen {
     }
 
     pub fn draw(&self, f: &mut Frame, area: Rect) {
-        // Define the ASCII art as a vector of lines
         let ascii_art = vec![
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
             "██ ▄▀▄ █ ██ █ ▄▄▀█▀ ██ ▄▄▀█ ▄▀████ ▄▄▀██▄█",
@@ -32,58 +31,33 @@ impl SplashScreen {
             "An Intelligent Software Development Copilot",
         ];
 
-        // Calculate the maximum width of the ASCII art
         let art_width = ascii_art.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
-
-        // Calculate the required width for the ASCII art section
         let ascii_section_width = art_width;
 
-        // Split the area horizontally: left for ASCII art, right for menu
         let hsplit = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(
-                [
-                    Constraint::Length(ascii_section_width), // Fixed width for ASCII art
-                    Constraint::Min(20),                     // Minimum width for menu
-                ]
-                .as_ref(),
-            )
+            .constraints([Constraint::Length(ascii_section_width), Constraint::Min(20)].as_ref())
             .split(area);
 
-        // Optional: Add borders for debugging
-        // Uncomment the following lines to visualize layout sections during development
-        /*
-        let ascii_block = Block::default().borders(Borders::ALL).title("ASCII Art");
-        f.render_widget(ascii_block, hsplit[0]);
-
-        let menu_block = Block::default().borders(Borders::ALL).title("Menu");
-        f.render_widget(menu_block, hsplit[1]);
-        */
-
-        // Split the left (ASCII art) vertically to center the art
         let ascii_vert = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Percentage(50), // Top padding to center vertically
-                    Constraint::Length(ascii_art.len() as u16), // ASCII art height
-                    Constraint::Percentage(50), // Bottom padding to center vertically
+                    Constraint::Percentage(50),
+                    Constraint::Length(ascii_art.len() as u16),
+                    Constraint::Percentage(50),
                 ]
                 .as_ref(),
             )
             .split(hsplit[0]);
 
-        // Prepare the ASCII art as a single string without wrapping
         let ascii_art_str = ascii_art.join("\n");
-
         let ascii_par = Paragraph::new(ascii_art_str)
             .alignment(Alignment::Center)
             .block(Block::default())
-            .wrap(Wrap { trim: false }); // Disable trimming to preserve ASCII art
-
+            .wrap(Wrap { trim: false });
         f.render_widget(ascii_par, ascii_vert[1]);
 
-        // Prepare the menu items
         let mut menu_lines = Vec::new();
         for (i, item) in self.menu_items.iter().enumerate() {
             let selected = i == self.selected_idx;
@@ -99,25 +73,21 @@ impl SplashScreen {
                 style,
             )));
         }
-
         let menu_par = Paragraph::new(menu_lines)
             .alignment(Alignment::Left)
             .block(Block::default())
-            .wrap(Wrap { trim: true }); // Enable wrapping for menu items
-
-        // Split the right (menu) vertically to center the menu
+            .wrap(Wrap { trim: true });
         let menu_vert = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Percentage(50), // Top padding to center vertically
-                    Constraint::Length(self.menu_items.len() as u16), // Menu height
-                    Constraint::Percentage(50), // Bottom padding to center vertically
+                    Constraint::Percentage(50),
+                    Constraint::Length(self.menu_items.len() as u16),
+                    Constraint::Percentage(50),
                 ]
                 .as_ref(),
             )
             .split(hsplit[1]);
-
         f.render_widget(menu_par, menu_vert[1]);
     }
 
