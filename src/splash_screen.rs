@@ -8,6 +8,13 @@ use ratatui::{
 };
 
 #[derive(Debug)]
+pub enum SplashScreenAction {
+    Quit,
+    StartChat,
+    DbDetails,
+}
+
+#[derive(Debug)]
 pub struct SplashScreen {
     pub selected_idx: usize,
     pub menu_items: Vec<&'static str>,
@@ -17,7 +24,7 @@ impl SplashScreen {
     pub fn new() -> Self {
         Self {
             selected_idx: 0,
-            menu_items: vec!["Start Chat", "Quit"],
+            menu_items: vec!["Start Chat", "DB Details", "Quit"],
         }
     }
 
@@ -28,7 +35,7 @@ impl SplashScreen {
             "██ █ █ █ ▀▀ █ ▀▀▄██ ██ ▀▀ █ █ █▀▀█ ▀▀ ██ ▄",
             "██ ███ █▀▀▀▄█▄█▄▄█▀ ▀█▄██▄█▄▄██▄▄█▄██▄█▄▄▄",
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-            "An Intelligent Software Development Copilot",
+            "an intelligent software development copilot",
         ];
 
         let art_width = ascii_art.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
@@ -110,6 +117,7 @@ impl SplashScreen {
                 match selected {
                     "Quit" => Some(SplashScreenAction::Quit),
                     "Start Chat" => Some(SplashScreenAction::StartChat),
+                    "DB Details" => Some(SplashScreenAction::DbDetails),
                     _ => None,
                 }
             }
@@ -117,10 +125,4 @@ impl SplashScreen {
             _ => None,
         }
     }
-}
-
-#[derive(Debug)]
-pub enum SplashScreenAction {
-    Quit,
-    StartChat,
 }

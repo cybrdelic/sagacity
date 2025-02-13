@@ -1,9 +1,14 @@
 use log::LevelFilter;
 use sqlx::{
+    migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     ConnectOptions, Pool, Sqlite,
 };
+use std::path::Path;
 use std::str::FromStr;
+
+// this macro collects migrations from the ./migrations folder at compile time
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug)]
 pub struct Db {
@@ -32,8 +37,24 @@ impl Db {
             .connect_with(options)
             .await?;
 
-        // run migrations from ./migrations folder
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        println!(
+            "found {} migrations in ./migrations:",
+            MIGRATOR.migrations.len()
+        );
+        for migration in MIGRATOR.migrations.iter() {
+            println!(" - v{}: {}", migration.version, migration.description);
+        }
+
+        println!("running migrations...");
+        MIGRATOR.run(&pool).await?;
+        println!("migrations applied successfully.");
+
+        // query current applied version for confirmation
+        let applied_version: i64 =
+            sqlx::query_scalar("select ifnull(max(version), 0) from _sqlx_migrations")
+                .fetch_one(&pool)
+                .await?;
+        println!("current db version: {}", applied_version);
 
         Ok(Db { pool })
     }

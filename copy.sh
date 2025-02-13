@@ -11,27 +11,27 @@ else
 fi
 
 # create a temporary file for concatenated content
-tmp_file=$(mktemp /tmp/all_rust_files_content.XXXXXX.txt)
+tmp_file=$(mktemp /tmp/all_files_content.XXXXXX.txt)
 
-# collect all .rs files, excluding target, build, and .git directories
-mapfile -t files < <(find . -type f -name "*.rs" ! -path "./target/*" ! -path "./build/*" ! -path "./.git/*")
+# collect all .rs and .sql files, excluding target, build, and .git directories
+mapfile -t files < <(find . -type f \( -name "*.rs" -o -name "*.sql" \) ! -path "./target/*" ! -path "./build/*" ! -path "./.git/*")
 total=${#files[@]}
 
-if (( total == 0 )); then
-    echo "no rust files found. aborting."
+if ((total == 0)); then
+    echo "no rust or sql files found. aborting."
     exit 1
 fi
 
-echo -e "\n\033[1;32m✨ processing ${total} rust files...\033[0m\n"
+echo -e "\n\033[1;32m✨ processing ${total} rust and sql files...\033[0m\n"
 
 count=0
 for file in "${files[@]}"; do
-    count=$((count+1))
+    count=$((count + 1))
     # print a fancy progress message with color and count
     printf "\033[1;34m[%-3d/%-3d] processing: %s\033[0m\n" "$count" "$total" "$file"
-    echo -e "\n\n=== $file ===\n" >> "$tmp_file"
-    cat "$file" >> "$tmp_file"
-    echo -e "\n" >> "$tmp_file"
+    echo -e "\n\n=== $file ===\n" >>"$tmp_file"
+    cat "$file" >>"$tmp_file"
+    echo -e "\n" >>"$tmp_file"
 done
 
 echo -e "\n\033[1;32m🚀 copying concatenated content to clipboard...\033[0m"
@@ -39,4 +39,4 @@ cat "$tmp_file" | $copy_cmd
 
 rm "$tmp_file"
 
-echo -e "\n\033[1;32m🎉 done. all rust file contents are now on your clipboard.\033[0m\n"
+echo -e "\n\033[1;32m🎉 done. all file contents are now on your clipboard.\033[0m\n"

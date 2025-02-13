@@ -29,7 +29,7 @@ use dotenv::var;
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use tokio::sync::Mutex;
 
-// Import the public constants from chat_view.
+// import public constants from chat_view
 use crate::chat_view::{ANTHROPIC_VERSION, CLAUDE_API_URL};
 
 use crate::{
@@ -176,7 +176,10 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         AppScreen::Indexing => draw_indexing(f, app),
         AppScreen::Chat => draw_chat(f, app),
         AppScreen::DBDetails => {
-            // instead of futures::executor::block_on, use tokio’s runtime handle.
+            // use block_in_place to avoid starting a nested runtime
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(db_details_view::draw_db_details(f, app))
+            });
         }
     }
 }
@@ -237,6 +240,9 @@ async fn handle_splash_input(
                 tokio::spawn(async move {
                     indexing_task(clone).await;
                 });
+            }
+            SplashScreenAction::DbDetails => {
+                app.screen = AppScreen::DBDetails;
             }
         }
     }
