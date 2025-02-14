@@ -2,13 +2,14 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
+#[derive(Debug)]
 pub struct LogView {
-    entries: Vec<String>,
-    scroll_offset: u16,
+    pub entries: Vec<String>,
+    pub scroll_offset: u16,
 }
 
 impl LogView {
@@ -19,8 +20,11 @@ impl LogView {
         }
     }
 
-    pub fn add_entry(&mut self, entry: String) {
+    pub fn add(&mut self, entry: String) {
         self.entries.push(entry);
+        if self.entries.len() > 200 {
+            self.entries.remove(0);
+        }
     }
 
     pub fn scroll_up(&mut self) {

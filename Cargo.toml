@@ -36,7 +36,7 @@ task = "0.0.1"
 claude-tokenizer = "0.3.0"
 open = "5.3.0"
 skim = "0.10.4"
-env = "0.1.0"
+env = "0.0.0"
 ratatui = "0.29.0"
 crossterm = "0.28.1"
 winit = "0.30.5"
@@ -54,3 +54,10 @@ pulldown-cmark = "0.12.2"
 lazy_static = "1.5.0"
 uuid = "1.11.0"
 copypasta = "0.10.1"
+sqlx = { version = "0.6", features = [
+    "sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+] }
+tracing = "0.1.41"
+anyhow = "1.0.95"

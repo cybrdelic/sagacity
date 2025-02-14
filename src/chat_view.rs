@@ -1,6 +1,6 @@
-use std::{error::Error, sync::Arc};
-
+use crate::chat_message::ChatMessage;
 use crate::App;
+use dotenv::var;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -9,17 +9,14 @@ use ratatui::{
     Frame,
 };
 use serde_json::{json, Value};
-use std::env::var;
+use std::{error::Error, sync::Arc};
 use tokio::sync::Mutex;
 
-use crate::chat_message::ChatMessage;
-
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub fn draw_chat(f: &mut Frame, app: &mut App) {
     let size = f.area();
-
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
@@ -28,39 +25,35 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
 
     let chat_vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // Messages
-            Constraint::Length(2), // Status
-            Constraint::Length(3), // Input
-        ])
+        .constraints(
+            [
+                Constraint::Min(1),
+                Constraint::Length(2),
+                Constraint::Length(3),
+            ]
+            .as_ref(),
+        )
         .split(horizontal_chunks[0]);
 
     let messages_area = chat_vertical_chunks[0];
     draw_messages(f, app, messages_area);
 
-    // Render status indicator
     app.status_indicator.update_spinner();
     app.status_indicator.render(f, chat_vertical_chunks[1]);
 
-    // Render input area
     draw_input(f, app, chat_vertical_chunks[2]);
-
-    // Render logs section
     draw_logs(f, app, horizontal_chunks[1], size);
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
-
-    for (idx, message) in app.chat_messages.iter().enumerate() {
+    for (_idx, message) in app.chat_messages.iter().enumerate() {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-
         let message_lines = message.render(area);
         lines.extend(message_lines);
     }
-
     let total_lines = lines.len() as u16;
     let available_height = area.height;
     let max_scroll = if total_lines > available_height {
@@ -78,14 +71,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default())
         .block(Block::default())
         .wrap(Wrap { trim: true });
-
     f.render_widget(msgs_para.scroll((chat_scroll, 0)), area);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let separator = "─".repeat(area.width as usize);
-
-    // Top separator
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             &separator,
@@ -99,7 +89,6 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Input line
     let input = Line::from(vec![
         Span::styled("→ ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.chat_input, Style::default().fg(Color::White)),
@@ -123,7 +112,6 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Bottom separator
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             &separator,
@@ -137,7 +125,6 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Set cursor position
     let cursor_x = area.x + 2 + app.chat_input.len() as u16 - scroll_offset;
     f.set_cursor_position((cursor_x, area.y + 1));
 }
@@ -145,13 +132,12 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
     let log_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(8)])
+        .constraints([Constraint::Min(1), Constraint::Length(8)].as_ref())
         .split(area);
 
-    // Vertical separator
     let vsep = "│".repeat(size.height as usize - 2);
     f.render_widget(
-        Paragraph::new(vsep).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(Span::raw(vsep)).style(Style::default().fg(Color::DarkGray)),
         Rect {
             x: area.x - 1,
             y: 1,
@@ -174,7 +160,6 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
 
     let total_log_lines = log_lines.len() as u16;
     let log_available_height = log_chunks[0].height;
-
     let max_log_scroll = if total_log_lines > log_available_height {
         total_log_lines - log_available_height
     } else {
@@ -189,7 +174,6 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
     let logs_para = Paragraph::new(log_lines)
         .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
-
     f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
 }
 
@@ -198,7 +182,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         let mut guard = app.lock().await;
         guard.chat_thinking = true;
         guard.chat_input.clear();
-        guard.logs.add("Processing query...");
+        guard.logs.add("Processing query...".to_string());
         guard.status_indicator.set_thinking(true);
         guard.status_indicator.set_status("Thinking...");
     }
@@ -219,24 +203,22 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
 
     {
         let mut guard = app.lock().await;
-        guard.logs.add("Sending request to Claude API...");
+        guard
+            .logs
+            .add("Sending request to Claude API...".to_string());
     }
 
     match get_claude_response(&prompt, &[]).await {
         Ok(response_data) => {
             let mut guard = app.lock().await;
-            guard.logs.add("Response received from API");
-
+            guard.logs.add("Response received from API".to_string());
             if let Some(warning) = response_data.warning {
-                guard.logs.add(&format!("API Warning: {}", warning));
+                guard.logs.add(format!("API Warning: {}", warning));
             }
-
-            // Create a new ChatMessage for the response
             let message = ChatMessage::new(response_data.content, false);
             guard.chat_messages.push(message);
-
             if let Some(usage) = response_data.usage {
-                guard.logs.add(&format!(
+                guard.logs.add(format!(
                     "Tokens used - Input: {}, Output: {}, Total: {}",
                     usage.input_tokens,
                     usage.output_tokens,
@@ -246,23 +228,23 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         }
         Err(e) => {
             let mut guard = app.lock().await;
-            match e.downcast_ref::<reqwest::Error>() {
-                Some(req_err) => {
-                    if req_err.is_timeout() {
-                        guard.logs.add("Error: API request timed out");
-                    } else if req_err.is_connect() {
-                        guard.logs.add("Error: Could not connect to API");
-                    } else if let Some(status) = req_err.status() {
-                        guard
-                            .logs
-                            .add(&format!("API Error ({}): {}", status, req_err));
-                    } else {
-                        guard.logs.add(&format!("API Error: {}", req_err));
-                    }
+            if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+                if req_err.is_timeout() {
+                    guard.logs.add("Error: API request timed out".to_string());
+                } else if req_err.is_connect() {
+                    guard
+                        .logs
+                        .add("Error: Could not connect to API".to_string());
+                } else if let Some(status) = req_err.status() {
+                    guard
+                        .logs
+                        .add(format!("API Error ({}): {}", status, req_err));
+                } else {
+                    guard.logs.add(format!("API Error: {}", req_err));
                 }
-                None => guard.logs.add(&format!("Error: {}", e)),
+            } else {
+                guard.logs.add(format!("Error: {}", e));
             }
-
             guard.chat_messages.push(ChatMessage::new(
                 "I encountered an error processing your request.".to_string(),
                 false,
@@ -275,7 +257,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         guard.chat_thinking = false;
         guard.status_indicator.set_thinking(false);
         guard.status_indicator.set_status("");
-        guard.logs.add("Request complete");
+        guard.logs.add("Request complete".to_string());
     }
 }
 
@@ -297,12 +279,8 @@ pub async fn get_claude_response(
     history: &[Value],
 ) -> Result<ClaudeResponse, Box<dyn Error + Send + Sync>> {
     let api_key = var("ANTHROPIC_API_KEY")?;
-
     let mut messages = history.to_vec();
-    messages.push(json!({
-        "role": "user",
-        "content": user_input
-    }));
+    messages.push(json!({ "role": "user", "content": user_input }));
 
     let payload = json!({
         "model": "claude-3-opus-20240229",
@@ -321,14 +299,11 @@ pub async fn get_claude_response(
         .await?;
 
     let response_data: Value = response.json().await?;
-
     let content = response_data["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-
     let warning = response_data["warning"].as_str().map(|s| s.to_string());
-
     let usage = if let (Some(input), Some(output)) = (
         response_data["usage"]["input_tokens"].as_u64(),
         response_data["usage"]["output_tokens"].as_u64(),
@@ -358,7 +333,6 @@ pub async fn summarize_file(
         "Please analyze this {} code and provide a brief summary of its purpose and functionality.\n\nCode:\n{}",
         language, content
     );
-
     let payload = json!({
         "model": "claude-3-opus-20240229",
         "max_tokens": 1024,
@@ -375,7 +349,6 @@ pub async fn summarize_file(
         .await?;
 
     let body: Value = response.json().await?;
-
     if let Some(error) = body["error"].as_object() {
         return Err(format!(
             "API Error: {} - {}",
@@ -384,7 +357,6 @@ pub async fn summarize_file(
         )
         .into());
     }
-
     Ok(body["content"][0]["text"]
         .as_str()
         .unwrap_or("Sorry, I couldn't process that request.")

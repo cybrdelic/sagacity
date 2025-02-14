@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-/// Represents a file node with progress and status.
 #[derive(Debug)]
 pub struct TreeNode {
     pub filename: String,
@@ -18,7 +17,6 @@ impl TreeNode {
     }
 }
 
-/// Manages log entries.
 #[derive(Debug)]
 pub struct LogPanel {
     pub entries: Vec<String>,
@@ -41,17 +39,16 @@ impl LogPanel {
     }
 }
 
-/// Handles chatbot-related data and indexing.
 #[derive(Debug)]
 pub struct Chatbot {
-    pub index: HashMap<String, (String, String)>,
+    pub index: std::collections::HashMap<String, (String, String)>,
     pub api_key: String,
 }
 
 impl Chatbot {
     pub fn new(api_key: String) -> Self {
         Self {
-            index: HashMap::new(),
+            index: std::collections::HashMap::new(),
             api_key,
         }
     }

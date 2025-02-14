@@ -1,24 +1,18 @@
-// src/indexing_view.rs
-
+use crate::{App, AppScreen, TreeNode};
 use ratatui::{
-    backend::Backend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 use std::{sync::Arc, time::SystemTime};
-
 use tokio::sync::Mutex;
 
 use crate::chat_view::summarize_file;
-use crate::AppScreen;
-use crate::{App, Chatbot, LogPanel, TreeNode}; // Removed `status_indicator` import
 
-/// Renders the indexing interface.
 pub fn draw_indexing(f: &mut Frame, app: &mut App) {
-    let size = f.area(); // Replaced f.size() with f.area()
+    let size = f.area();
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)].as_ref())
@@ -61,7 +55,7 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .title(" Status ")
-                .borders(Borders::ALL)
+                .borders(ratatui::widgets::Borders::ALL)
                 .border_style(Style::default().fg(Color::White)),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -78,7 +72,7 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
             node.filename,
             (node.progress * 100.0) as u8,
             bar,
-            node.status,
+            node.status
         );
         lines.push(Line::from(Span::raw(line_str)));
     }
@@ -86,17 +80,14 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .title(" Files ")
-                .borders(Borders::ALL)
+                .borders(ratatui::widgets::Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(tree_para, left_split[1]);
 
     let total_files = app.tree.len() as f32;
-    let mut total_progress = 0.0;
-    for node in &app.tree {
-        total_progress += node.progress;
-    }
+    let total_progress: f32 = app.tree.iter().map(|node| node.progress).sum();
     let overall = if total_files > 0.0 {
         total_progress / total_files
     } else {
@@ -111,7 +102,7 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .title(" Progress ")
-                .borders(Borders::ALL)
+                .borders(ratatui::widgets::Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -119,9 +110,8 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
 
     let logs_block = Block::default()
         .title(" Logs ")
-        .borders(Borders::ALL)
+        .borders(ratatui::widgets::Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
-
     let inner_logs_area = logs_block.inner(main_chunks[1]);
     f.render_widget(logs_block, main_chunks[1]);
 
@@ -129,18 +119,16 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
     for entry in &app.logs.entries {
         log_lines.push(Line::from(Span::raw(entry)));
     }
-
     let logs_para = Paragraph::new(log_lines)
         .wrap(Wrap { trim: true })
         .scroll((app.logs_scroll, 0));
     f.render_widget(logs_para, inner_logs_area);
 }
 
-/// Handles the indexing task asynchronously.
 pub async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
-        guard.logs.add("Starting codebase indexing...");
+        guard.logs.add("Starting codebase indexing...".to_string());
         guard.indexing_start_time = Some(SystemTime::now());
         guard.tree = vec![TreeNode::new("src/main.rs".into())];
     }
@@ -153,7 +141,7 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
     let main_rs = "src/main.rs";
     {
         let mut guard = app.lock().await;
-        guard.logs.add("Indexing main.rs...");
+        guard.logs.add("Indexing main.rs...".to_string());
     }
 
     if let Ok(content) = std::fs::read_to_string(main_rs) {
@@ -163,11 +151,11 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
                 .chatbot
                 .index
                 .insert(main_rs.to_string(), (summary, "rust".to_string()));
-            guard.logs.add("Indexed main.rs successfully");
-
-            let node = guard.tree.get_mut(0).unwrap();
-            node.progress = 1.0;
-            node.status = "done".into();
+            guard.logs.add("Indexed main.rs successfully".to_string());
+            if let Some(node) = guard.tree.get_mut(0) {
+                node.progress = 1.0;
+                node.status = "done".into();
+            }
             guard.indexing_count += 1;
         }
     }
@@ -175,7 +163,7 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
         guard.indexing_done = true;
-        guard.logs.add("Indexing complete!");
-        guard.screen = AppScreen::Chat; // Now recognized due to import
+        guard.logs.add("Indexing complete!".to_string());
+        guard.screen = AppScreen::Chat;
     }
 }
