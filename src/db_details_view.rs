@@ -1,7 +1,7 @@
 use crate::App;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
@@ -9,21 +9,52 @@ use ratatui::{
 use sqlx::Row;
 
 pub async fn draw_db_details(f: &mut Frame<'_>, app: &App) {
-    let area = f.area();
-    // divide into 3 vertical chunks: db info, migrations, schema layout
+    // Outer container to prevent content from touching the screen edge.
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Database Details ",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::LightBlue));
+    let outer_area = f.area();
+    f.render_widget(outer_block.clone(), outer_area);
+    let inner_area = outer_block.inner(outer_area);
+
+    // Divide inner_area vertically into four sections:
+    // 0: Back button (top)
+    // 1: Details grid
+    // 2: Tables grid
+    // 3: Markdown instructions (scrollable)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
+        .margin(1)
         .constraints(
             [
-                Constraint::Length(3),
-                Constraint::Length(7),
-                Constraint::Min(0),
+                Constraint::Length(3),  // Back Button
+                Constraint::Length(5),  // Details Grid
+                Constraint::Length(10), // Tables Grid
+                Constraint::Min(8),     // Markdown Instructions
             ]
             .as_ref(),
         )
-        .split(area);
+        .split(inner_area);
 
-    // db info block
+    // --- Section 0: Back Button ---
+    let back_button = Paragraph::new("Press Esc to go back")
+        .style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Navigation"));
+    f.render_widget(back_button, chunks[0]);
+
+    // --- Section 1: Details Grid ---
+    // Fetch database version.
     let version: i64 = if let Some(db) = &app.db {
         sqlx::query_scalar("select ifnull(max(version), 0) from _sqlx_migrations")
             .fetch_one(&db.pool)
@@ -32,44 +63,61 @@ pub async fn draw_db_details(f: &mut Frame<'_>, app: &App) {
     } else {
         0
     };
-    let info_line = format!("db: {} | version: {}", app.db_path, version);
-    let info_para = Paragraph::new(info_line)
-        .block(Block::default().title("db info").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White));
-    f.render_widget(info_para, chunks[0]);
-
-    // migrations block - list applied migrations
-    let mut mig_lines = vec![];
-    if let Some(db) = &app.db {
-        if let Ok(rows) = sqlx::query("select version, description, installed_on, success from _sqlx_migrations order by version")
-            .fetch_all(&db.pool)
-            .await {
-            for row in rows {
-                let ver: i64 = row.try_get("version").unwrap_or(0);
-                let desc: String = row.try_get("description").unwrap_or_else(|_| "".to_string());
-                let installed_on: String = row.try_get("installed_on").unwrap_or_else(|_| "".to_string());
-                let success: bool = row.try_get("success").unwrap_or(false);
-                mig_lines.push(Line::from(Span::raw(
-                    format!("v{} - {} | {} | {}", ver, desc, installed_on, if success { "ok" } else { "fail" })
-                )));
-            }
-        } else {
-            mig_lines.push(Line::from(Span::raw("failed to query migrations")));
-        }
+    // Fetch table count.
+    let table_count: i64 = if let Some(db) = &app.db {
+        sqlx::query_scalar(
+            "select count(*) from sqlite_master where type='table' and name not like 'sqlite_%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or(0)
     } else {
-        mig_lines.push(Line::from(Span::raw("no db connection available")));
-    }
-    let mig_para = Paragraph::new(mig_lines)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title("migrations").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White));
-    f.render_widget(mig_para, chunks[1]);
+        0
+    };
+    // Fetch migrations count.
+    let migration_count: i64 = if let Some(db) = &app.db {
+        sqlx::query_scalar("select count(*) from _sqlx_migrations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    // schema layout block - list tables & their sql
-    let mut schema_lines = vec![];
+    // Split details grid into two columns.
+    let details_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(chunks[1]);
+
+    let details_left = Paragraph::new(format!(
+        "URL: sqlite://{}\nVersion: {}",
+        app.db_path, version
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Connection Details"),
+    )
+    .style(Style::default().fg(Color::White))
+    .wrap(Wrap { trim: true });
+    f.render_widget(details_left, details_chunks[0]);
+
+    let details_right = Paragraph::new(format!(
+        "Tables: {}\nMigrations: {}",
+        table_count, migration_count
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Metadata"))
+    .style(Style::default().fg(Color::White))
+    .wrap(Wrap { trim: true });
+    f.render_widget(details_right, details_chunks[1]);
+
+    // --- Section 2: Tables Grid ---
+    let mut table_names = Vec::new();
+    let mut table_schemas = Vec::new();
     if let Some(db) = &app.db {
         if let Ok(rows) = sqlx::query(
-            "select name, sql from sqlite_master where type = 'table' and name not like 'sqlite_%'",
+            "select name, sql from sqlite_master where type='table' and name not like 'sqlite_%'",
         )
         .fetch_all(&db.pool)
         .await
@@ -77,20 +125,63 @@ pub async fn draw_db_details(f: &mut Frame<'_>, app: &App) {
             for row in rows {
                 let tname: String = row.try_get("name").unwrap_or_default();
                 let tsql: String = row.try_get("sql").unwrap_or_default();
-                schema_lines.push(Line::from(Span::raw(format!("table: {}\n{}", tname, tsql))));
-                schema_lines.push(Line::from(""));
+                table_names.push(tname);
+                table_schemas.push(tsql);
             }
         }
-    } else {
-        schema_lines.push(Line::from("no db connection available"));
     }
-    let schema_para = Paragraph::new(schema_lines)
-        .wrap(Wrap { trim: true })
+    let table_grid_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+        .split(chunks[2]);
+
+    let table_names_text = table_names.join("\n");
+    let table_schemas_text = table_schemas.join("\n\n");
+    let table_names_para = Paragraph::new(table_names_text)
+        .block(Block::default().borders(Borders::ALL).title("Table Names"))
+        .style(Style::default().fg(Color::LightYellow))
+        .wrap(Wrap { trim: true });
+    let table_schemas_para = Paragraph::new(table_schemas_text)
         .block(
             Block::default()
-                .title("schema layout")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .title("Table Schemas"),
         )
-        .style(Style::default().fg(Color::White));
-    f.render_widget(schema_para, chunks[2]);
+        .style(Style::default().fg(Color::LightCyan))
+        .wrap(Wrap { trim: true });
+    f.render_widget(table_names_para, table_grid_chunks[0]);
+    f.render_widget(table_schemas_para, table_grid_chunks[1]);
+
+    // --- Section 3: Markdown Rendered SQLx CLI Instructions (Scrollable) ---
+    let markdown_instructions = r#"
+# SQLx CLI Connection Instructions
+
+To inspect and manage your database via SQLx CLI, follow these steps:
+
+1. **Set the Environment Variable:**
+
+   ```bash
+   export DATABASE_URL="sqlite://<path-to-your-db>"
+   ```
+
+2. **Run the Migration Info Command:**
+
+   ```bash
+   sqlx migrate info
+   ```
+
+This command will display your migration history and current schema details.
+
+For further help, please refer to the [SQLx CLI Documentation](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli).
+"#;
+    let markdown_para = Paragraph::new(markdown_instructions)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("SQLx CLI Instructions"),
+        )
+        .style(Style::default().fg(Color::Green))
+        .wrap(Wrap { trim: true })
+        .scroll((app.db_markdown_scroll, 0)); // 'db_markdown_scroll' should be maintained in your App struct.
+    f.render_widget(markdown_para, chunks[3]);
 }

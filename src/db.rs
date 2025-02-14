@@ -1,13 +1,13 @@
-use log::LevelFilter;
+// src/db.rs
+use log::info;
 use sqlx::{
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     ConnectOptions, Pool, Row, Sqlite,
 };
-use std::path::Path;
 use std::str::FromStr;
 
-// this macro collects migrations from the ./migrations folder at compile time
+// This macro collects migrations from the ./migrations folder at compile time.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug)]
@@ -23,13 +23,14 @@ impl Db {
             format!("sqlite://{}", path)
         };
 
+        // Ensure DATABASE_URL is set for sqlx.
         if std::env::var("DATABASE_URL").is_err() {
             std::env::set_var("DATABASE_URL", &connection_str);
         }
 
         let options = SqliteConnectOptions::from_str(&connection_str)?
             .create_if_missing(true)
-            .log_statements(LevelFilter::Debug)
+            .log_statements(log::LevelFilter::Debug)
             .clone();
 
         let pool = SqlitePoolOptions::new()
@@ -37,36 +38,40 @@ impl Db {
             .connect_with(options)
             .await?;
 
-        println!(
-            "found {} migrations in ./migrations:",
+        // Log migration details instead of printing to stdout.
+        info!(
+            "Found {} migrations in ./migrations",
             MIGRATOR.migrations.len()
         );
         for migration in MIGRATOR.migrations.iter() {
-            println!(" - v{}: {}", migration.version, migration.description);
+            info!(
+                "Migration v{}: {}",
+                migration.version, migration.description
+            );
         }
 
-        println!("running migrations...");
+        info!("Running migrations...");
         MIGRATOR.run(&pool).await?;
-        println!("migrations applied successfully.");
+        info!("Migrations applied successfully.");
 
-        // dump schema
-        println!("dumping schema:");
-        let rows = sqlx::query("select name, sql from sqlite_master")
+        // Log the database schema for reference.
+        info!("Dumping schema:");
+        let rows = sqlx::query("SELECT name, sql FROM sqlite_master")
             .fetch_all(&pool)
             .await?;
         for row in rows {
             let name: String = row.try_get("name")?;
             let sql: String = row.try_get("sql")?;
-            println!("--- table: {} ---", name);
-            println!("{}", sql);
+            info!("--- table: {} ---", name);
+            info!("{}", sql);
         }
 
-        // query current applied version for confirmation
+        // Query the current applied version.
         let applied_version: i64 =
-            sqlx::query_scalar("select ifnull(max(version), 0) from _sqlx_migrations")
+            sqlx::query_scalar("SELECT ifnull(max(version), 0) FROM _sqlx_migrations")
                 .fetch_one(&pool)
                 .await?;
-        println!("current db version: {}", applied_version);
+        info!("Current DB version: {}", applied_version);
 
         Ok(Db { pool })
     }
