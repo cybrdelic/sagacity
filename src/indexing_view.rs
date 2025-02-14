@@ -124,13 +124,15 @@ pub fn draw_indexing(f: &mut Frame, app: &mut App) {
         .scroll((app.logs_scroll, 0));
     f.render_widget(logs_para, inner_logs_area);
 }
+use ignore::WalkBuilder;
 
 pub async fn indexing_task(app: Arc<Mutex<App>>) {
     {
         let mut guard = app.lock().await;
         guard.logs.add("Starting codebase indexing...".to_string());
         guard.indexing_start_time = Some(SystemTime::now());
-        guard.tree = vec![TreeNode::new("src/main.rs".into())];
+        // Clear any previous tree nodes.
+        guard.tree.clear();
     }
 
     let api_key = {
@@ -138,25 +140,94 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
         guard.chatbot.api_key.clone()
     };
 
-    let main_rs = "src/main.rs";
-    {
-        let mut guard = app.lock().await;
-        guard.logs.add("Indexing main.rs...".to_string());
+    // Define the directories you want to index (e.g. "src" and "docs")
+    let directories = vec!["src", "docs"];
+    let mut files_to_index = Vec::new();
+
+    for dir in directories {
+        // Build a walker that respects .gitignore files and also filters out unwanted directories.
+        let walker = WalkBuilder::new(dir)
+            // Optionally ignore hidden files.
+            .hidden(true)
+            // Filter out paths that contain unwanted directory names.
+            .filter_entry(|entry| {
+                let path = entry.path();
+                let path_str = path.to_string_lossy();
+                // Ignore common directories
+                if path_str.contains("/.git/")
+                    || path_str.contains("/target/")
+                    || path_str.contains("/node_modules/")
+                {
+                    return false;
+                }
+                true
+            })
+            .build();
+
+        for result in walker {
+            if let Ok(entry) = result {
+                // Only process files.
+                if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    let path_str = entry.path().to_string_lossy().to_string();
+                    // Filter to index only specific file types.
+                    if path_str.ends_with(".rs") || path_str.ends_with(".md") {
+                        files_to_index.push(path_str);
+                    }
+                }
+            }
+        }
     }
 
-    if let Ok(content) = std::fs::read_to_string(main_rs) {
-        if let Ok(summary) = summarize_file(&content, "rust", &api_key).await {
+    {
+        let mut guard = app.lock().await;
+        // Initialize the tree with a node for each file to be indexed.
+        guard.tree = files_to_index
+            .iter()
+            .map(|f| TreeNode::new(f.clone()))
+            .collect();
+    }
+
+    // Process each file.
+    for file_path in files_to_index {
+        {
             let mut guard = app.lock().await;
-            guard
-                .chatbot
-                .index
-                .insert(main_rs.to_string(), (summary, "rust".to_string()));
-            guard.logs.add("Indexed main.rs successfully".to_string());
-            if let Some(node) = guard.tree.get_mut(0) {
-                node.progress = 1.0;
-                node.status = "done".into();
+            guard.logs.add(format!("Indexing {}...", file_path));
+        }
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            // Determine the language based on the file extension.
+            let language = if file_path.ends_with(".rs") {
+                "rust"
+            } else if file_path.ends_with(".md") {
+                "markdown"
+            } else {
+                "text"
+            };
+
+            if let Ok(summary) = summarize_file(&content, language, &api_key).await {
+                let mut guard = app.lock().await;
+                guard
+                    .chatbot
+                    .index
+                    .insert(file_path.clone(), (summary, language.to_string()));
+                guard
+                    .logs
+                    .add(format!("Indexed {} successfully", file_path));
+                if let Some(node) = guard
+                    .tree
+                    .iter_mut()
+                    .find(|node| node.filename == file_path)
+                {
+                    node.progress = 1.0;
+                    node.status = "done".into();
+                }
+                guard.indexing_count += 1;
+            } else {
+                let mut guard = app.lock().await;
+                guard.logs.add(format!("Failed to index {}", file_path));
             }
-            guard.indexing_count += 1;
+        } else {
+            let mut guard = app.lock().await;
+            guard.logs.add(format!("Could not read {}", file_path));
         }
     }
 
