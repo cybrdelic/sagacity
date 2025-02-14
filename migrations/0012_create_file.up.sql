@@ -1,4 +1,3 @@
---! sqlx up
 create table file (
     id integer primary key autoincrement,
     directory_id integer,
@@ -8,5 +7,3 @@ create table file (
     updated_at datetime default current_timestamp,
     foreign key (directory_id) references directory(id)
 );
---! sqlx down
-drop table if exists file;

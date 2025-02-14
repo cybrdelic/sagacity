@@ -2,7 +2,7 @@ use log::LevelFilter;
 use sqlx::{
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    ConnectOptions, Pool, Sqlite,
+    ConnectOptions, Pool, Row, Sqlite,
 };
 use std::path::Path;
 use std::str::FromStr;
@@ -48,6 +48,18 @@ impl Db {
         println!("running migrations...");
         MIGRATOR.run(&pool).await?;
         println!("migrations applied successfully.");
+
+        // dump schema
+        println!("dumping schema:");
+        let rows = sqlx::query("select name, sql from sqlite_master")
+            .fetch_all(&pool)
+            .await?;
+        for row in rows {
+            let name: String = row.try_get("name")?;
+            let sql: String = row.try_get("sql")?;
+            println!("--- table: {} ---", name);
+            println!("{}", sql);
+        }
 
         // query current applied version for confirmation
         let applied_version: i64 =

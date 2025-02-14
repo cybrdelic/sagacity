@@ -1,4 +1,3 @@
---! sqlx up
 create table contextualization_index (
     id integer primary key autoincrement,
     file_id integer,
@@ -7,5 +6,3 @@ create table contextualization_index (
     updated_at datetime default current_timestamp,
     foreign key (file_id) references file(id)
 );
---! sqlx down
-drop table if exists contextualization_index;

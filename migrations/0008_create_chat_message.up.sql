@@ -1,4 +1,3 @@
---! sqlx up
 create table chat_message (
     id integer primary key autoincrement,
     conversation_id integer not null,
@@ -7,5 +6,3 @@ create table chat_message (
     created_at datetime default current_timestamp,
     foreign key (conversation_id) references conversation(id)
 );
---! sqlx down
-drop table if exists chat_message;
