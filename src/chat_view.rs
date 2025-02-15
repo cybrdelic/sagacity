@@ -196,7 +196,9 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         ctx
     };
 
-    let prompt = format!(
+    // <<< ADDED >>>
+    // Build a final prompt containing the codebase context and user question.
+    let final_prompt = format!(
         "Based on this codebase context:\n{}\n\nAnswer this question: {}",
         context, user_input
     );
@@ -206,10 +208,36 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         guard
             .logs
             .add("Sending request to Claude API...".to_string());
+
+        // Log a small snippet of the prompt to confirm what is being sent.
+        let snippet = if final_prompt.len() > 120 {
+            format!("{}...", &final_prompt[..120])
+        } else {
+            final_prompt.clone()
+        };
+        guard.logs.add(format!("Prompt snippet: \"{}\"", snippet));
     }
 
-    match get_claude_response(&prompt, &[]).await {
+    // <<< CHANGED >>> Use final_prompt instead of `prompt`
+    match get_claude_response(&final_prompt, &[]).await {
         Ok(response_data) => {
+            {
+                // <<< ADDED >>>
+                let mut guard = app.lock().await;
+                guard.logs.add("Claude API call success!".to_string());
+                if response_data.content.len() < 500 {
+                    guard.logs.add(format!(
+                        "Claude response content: {}",
+                        response_data.content
+                    ));
+                } else {
+                    guard.logs.add(format!(
+                        "Claude response content length: {} chars",
+                        response_data.content.len()
+                    ));
+                }
+            }
+
             let mut guard = app.lock().await;
             guard.logs.add("Response received from API".to_string());
             if let Some(warning) = response_data.warning {
@@ -228,6 +256,17 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         }
         Err(e) => {
             let mut guard = app.lock().await;
+            // <<< ADDED >>>
+            guard
+                .logs
+                .add("Claude API call returned an error.".to_string());
+            if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+                if let Some(status) = req_err.status() {
+                    guard.logs.add(format!("HTTP Status: {}", status));
+                }
+            }
+            guard.logs.add(format!("Full error: {}", e));
+
             if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
                 if req_err.is_timeout() {
                     guard.logs.add("Error: API request timed out".to_string());

@@ -29,7 +29,7 @@ use dotenv::var;
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use tokio::sync::Mutex;
 
-// import public constants from chat_view
+// Import public constants from chat_view.
 use crate::chat_view::{ANTHROPIC_VERSION, CLAUDE_API_URL};
 
 use crate::{
@@ -40,6 +40,10 @@ use crate::{
     splash_screen::{SplashScreen, SplashScreenAction},
     status_indicator::StatusIndicator,
 };
+
+// --- Logging Initialization ---
+// We use flexi_logger to write logs to a file without interfering with TUI output.
+use flexi_logger::{FileSpec, Logger, WriteMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
@@ -134,6 +138,13 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     dotenv::dotenv().ok();
+
+    // Initialize flexi_logger to write logs to a file.
+    Logger::try_with_str("info")?
+        .write_mode(WriteMode::BufferAndFlush)
+        .log_to_file(FileSpec::default())
+        .start()?;
+
     setup_terminal()?;
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -176,9 +187,9 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     match app.screen {
         AppScreen::Splash => app.splash_screen.draw(f, f.area()),
         AppScreen::Indexing => draw_indexing(f, app),
-        AppScreen::Chat => draw_chat(f, app),
+        AppScreen::Chat => crate::chat_view::draw_chat(f, app),
         AppScreen::DBDetails => {
-            // use block_in_place to avoid starting a nested runtime
+            // Use block_in_place to avoid starting a nested runtime.
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(db_details_view::draw_db_details(f, app))
             });

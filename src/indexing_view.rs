@@ -229,6 +229,16 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
                     Ok(content) => {
                         // Update progress: file read complete.
                         update_progress(&app_inner, &file_path, 0.6, "read").await;
+
+                        // <<< ADDED >>>
+                        {
+                            let mut guard = app_inner.lock().await;
+                            guard.logs.add(format!(
+                                "Sending summarize_file request to Claude for {}",
+                                file_path
+                            ));
+                        }
+
                         let language = if file_path.ends_with(".rs") {
                             "rust"
                         } else if file_path.ends_with(".md") {
@@ -236,14 +246,32 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
                         } else {
                             "text"
                         };
+
                         match summarize_file(&content, language, &api_key).await {
                             Ok(summary) => {
+                                // <<< ADDED >>>
+                                {
+                                    let mut guard = app_inner.lock().await;
+                                    guard.logs.add(format!(
+                                        "Claude responded successfully for {} ({} bytes in summary)",
+                                        file_path,
+                                        summary.len()
+                                    ));
+                                }
                                 // Update progress: summarization complete.
                                 update_progress(&app_inner, &file_path, 1.0, "done").await;
                                 Some((file_path, summary, language.to_string()))
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 update_progress(&app_inner, &file_path, 1.0, "failed").await;
+                                // <<< ADDED >>>
+                                {
+                                    let mut guard = app_inner.lock().await;
+                                    guard.logs.add(format!(
+                                        "Claude summarization failed for {}: {}",
+                                        file_path, e
+                                    ));
+                                }
                                 None
                             }
                         }
