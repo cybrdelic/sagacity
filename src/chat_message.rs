@@ -238,19 +238,35 @@ impl ChatMessage {
             Span::styled(indent.to_string(), style),
             Span::styled("╰─".to_string(), style),
         ];
+        
+        // Show navigation hints when a message is focused
+        if self.focused_chunk.is_some() {
+            let hint_style = Style::default().fg(Color::DarkGray);
+            footer_spans.extend(vec![
+                Span::styled(" [", hint_style),
+                Span::styled("←", Style::default().fg(Color::Yellow)),
+                Span::styled("/", hint_style),
+                Span::styled("→", Style::default().fg(Color::Yellow)),
+                Span::styled(" to navigate chunks]", hint_style),
+            ]);
+        }
+        
+        // Show copy instructions in highlight mode
         if self.highlight_mode {
             let code_blocks_count = self.code_blocks().count();
             if code_blocks_count > 0 {
+                let copy_style = Style::default().fg(Color::DarkGray);
                 footer_spans.extend(vec![
-                    Span::styled(" [ESC+", style.add_modifier(Modifier::DIM)),
+                    Span::styled(" [ESC+", copy_style),
                     Span::styled(
                         format!("1-{}", code_blocks_count),
-                        style.add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("] to copy", style.add_modifier(Modifier::DIM)),
+                    Span::styled("] to copy", copy_style),
                 ]);
             }
         }
+        
         lines.push(Line::from(footer_spans));
     }
 
@@ -263,58 +279,123 @@ impl ChatMessage {
         area: Rect,
     ) {
         let indent = if self.from_user { "  " } else { "" };
+        
+        // Enhanced focus indicator
+        let (line_prefix, line_color) = if is_focused {
+            ("│> ", Color::Yellow)  // Show a highlighted arrow for focused chunks
+        } else {
+            ("│ ", base_style.fg.unwrap_or(Color::Reset))
+        };
+        
         match &chunk.content {
             ChunkType::Code(snippet) => {
                 let code_style = if is_focused {
-                    base_style.add_modifier(Modifier::REVERSED)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
                 };
+                
+                let header_style = if is_focused {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    base_style
+                };
+                
+                // Code block header
                 lines.push(Line::from(vec![
                     Span::styled(indent.to_string(), base_style),
-                    Span::styled("│ ```", code_style),
-                    Span::styled(snippet.language.clone(), code_style),
+                    Span::styled(line_prefix, Style::default().fg(line_color)),
+                    Span::styled("```", header_style),
+                    Span::styled(snippet.language.clone(), header_style.add_modifier(Modifier::UNDERLINED)),
                 ]));
+                
+                // Code content
                 for code_line in snippet.content.lines() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("│ ", base_style),
+                        Span::styled(if is_focused {"│| "} else {"│ "}, Style::default().fg(line_color)),
                         Span::styled(code_line.to_string(), code_style),
                     ]));
                 }
+                
+                // Code block footer
                 lines.push(Line::from(vec![
                     Span::styled(indent.to_string(), base_style),
-                    Span::styled("│ ```", code_style),
+                    Span::styled(line_prefix, Style::default().fg(line_color)),
+                    Span::styled("```", header_style),
                 ]));
             }
             ChunkType::Text(text) => {
                 let text_style = if is_focused {
-                    base_style.add_modifier(Modifier::REVERSED)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
                 };
+                
                 let wrap_width = (area.width as usize).saturating_sub(4);
                 let wrapped = textwrap::wrap(text, wrap_width);
+                let is_empty = wrapped.is_empty();
+                
+                // Add a focus marker at the top of focused text chunks
+                if is_focused && !is_empty {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("╭─── Text ───", Style::default().fg(Color::Yellow)),
+                    ]));
+                }
+                
                 for line in wrapped {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("│ ", base_style),
+                        Span::styled(line_prefix, Style::default().fg(line_color)),
                         Span::styled(line.to_string(), text_style),
+                    ]));
+                }
+                
+                // Add a focus marker at the bottom of focused text chunks
+                if is_focused && !is_empty {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("╰────────────", Style::default().fg(Color::Yellow)),
                     ]));
                 }
             }
             ChunkType::Steps(steps) => {
                 let step_style = if is_focused {
-                    base_style.add_modifier(Modifier::REVERSED)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
                 };
+                
+                // Add a focus marker at the top of focused step chunks
+                if is_focused && !steps.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("╭─── Steps ───", Style::default().fg(Color::Yellow)),
+                    ]));
+                }
+                
                 for (i, step) in steps.iter().enumerate() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("│ ", base_style),
+                        Span::styled(line_prefix, Style::default().fg(line_color)),
                         Span::styled(format!("{}. ", i + 1), step_style),
                         Span::styled(step.clone(), step_style),
+                    ]));
+                }
+                
+                // Add a focus marker at the bottom of focused step chunks
+                if is_focused && !steps.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), base_style),
+                        Span::styled("╰─────────────", Style::default().fg(Color::Yellow)),
                     ]));
                 }
             }

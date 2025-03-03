@@ -22,7 +22,7 @@ mod splash_screen;
 mod status_indicator;
 mod test_view;
 
-use chat_message::ChatMessage;
+use chat_message::{ChatMessage, ChunkType};
 use copypasta::ClipboardProvider;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -202,6 +202,36 @@ impl App {
             self.chat_messages.len(),
             self.chat_scroll
         ));
+    }
+    
+    pub fn show_message_navigation_status(&mut self) {
+        if let Some(msg_idx) = self.focused_message_index {
+            if let Some(message) = self.chat_messages.get(msg_idx) {
+                let msg_info = if self.chat_messages.len() > 1 {
+                    format!("Message {}/{}", msg_idx + 1, self.chat_messages.len())
+                } else {
+                    "Message 1/1".to_string()
+                };
+                
+                let chunk_info = if let Some(chunk_idx) = message.focused_chunk {
+                    if message.chunks.len() > 1 {
+                        let chunk_type = match &message.chunks[chunk_idx].content {
+                            ChunkType::Code(_) => "Code Block",
+                            ChunkType::Text(_) => "Text Block",
+                            ChunkType::Steps(_) => "Steps Block",
+                        };
+                        format!(" | {} {}/{}", chunk_type, chunk_idx + 1, message.chunks.len())
+                    } else {
+                        "".to_string()
+                    }
+                } else {
+                    "".to_string()
+                };
+                
+                let status = format!("{}{} | ←/→ to navigate chunks", msg_info, chunk_info);
+                self.status_indicator.set_status(status);
+            }
+        }
     }
 }
 
@@ -471,18 +501,41 @@ async fn handle_chat_input(
                 if let Some(idx) = app.focused_message_index {
                     if idx > 0 {
                         app.focused_message_index = Some(idx - 1);
+                        app.show_message_navigation_status();
                     }
                 }
             } else if !app.chat_messages.is_empty() {
                 app.focused_message_index = Some(app.chat_messages.len() - 1);
+                app.show_message_navigation_status();
             }
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
             if let Some(idx) = app.focused_message_index {
                 if idx < app.chat_messages.len() - 1 {
                     app.focused_message_index = Some(idx + 1);
+                    app.show_message_navigation_status();
                 } else {
                     app.focused_message_index = None;
+                    app.status_indicator.clear_status();
+                }
+            }
+        }
+        // Within-message chunk navigation using Left/Right arrows
+        (KeyModifiers::NONE, KeyCode::Left) => {
+            if let Some(idx) = app.focused_message_index {
+                if let Some(message) = app.chat_messages.get_mut(idx) {
+                    message.focus_previous();
+                    app.logs.add(format!("Focused previous chunk in message {}", idx));
+                    app.show_message_navigation_status();
+                }
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Right) => {
+            if let Some(idx) = app.focused_message_index {
+                if let Some(message) = app.chat_messages.get_mut(idx) {
+                    message.focus_next();
+                    app.logs.add(format!("Focused next chunk in message {}", idx));
+                    app.show_message_navigation_status();
                 }
             }
         }
