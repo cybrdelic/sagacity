@@ -226,17 +226,36 @@ impl ChatMessage {
 
     fn render_header(&self, lines: &mut Vec<Line<'static>>, style: Style) {
         let indent = if self.from_user { "  " } else { "" };
+        let header_color = if self.from_user {
+            Color::Rgb(255, 223, 128)  // Light gold for user messages
+        } else {
+            Color::Rgb(144, 238, 144)  // Light green for assistant messages
+        };
+        
         lines.push(Line::from(vec![
             Span::styled(indent.to_string(), style),
-            Span::styled("┌─".to_string(), style),
+            Span::styled("┌", Style::default().fg(header_color)),
+            Span::styled("───", Style::default().fg(header_color)),
+            Span::styled(
+                if self.from_user { " YOU " } else { " ASSISTANT " },
+                Style::default().fg(header_color).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled("───".to_string(), Style::default().fg(header_color)),
         ]));
     }
 
     fn render_footer(&self, lines: &mut Vec<Line<'static>>, style: Style) {
         let indent = if self.from_user { "  " } else { "" };
+        let footer_color = if self.from_user {
+            Color::Rgb(255, 223, 128)  // Light gold for user messages
+        } else {
+            Color::Rgb(144, 238, 144)  // Light green for assistant messages
+        };
+        
         let mut footer_spans = vec![
             Span::styled(indent.to_string(), style),
-            Span::styled("╰─".to_string(), style),
+            Span::styled("╰", Style::default().fg(footer_color)),
+            Span::styled("───".to_string(), Style::default().fg(footer_color)),
         ];
         
         // Show navigation hints when a message is focused
@@ -244,10 +263,14 @@ impl ChatMessage {
             let hint_style = Style::default().fg(Color::DarkGray);
             footer_spans.extend(vec![
                 Span::styled(" [", hint_style),
-                Span::styled("←", Style::default().fg(Color::Yellow)),
+                Span::styled("←", Style::default().fg(Color::Rgb(255, 165, 0))),  // Orange
                 Span::styled("/", hint_style),
-                Span::styled("→", Style::default().fg(Color::Yellow)),
-                Span::styled(" to navigate chunks]", hint_style),
+                Span::styled("→", Style::default().fg(Color::Rgb(255, 165, 0))),  // Orange
+                Span::styled(" navigate", hint_style),
+                Span::styled(" • ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::Rgb(135, 206, 250))),  // Light Sky Blue
+                Span::styled(" copy", hint_style),
+                Span::styled("]", hint_style),
             ]);
         }
         
@@ -282,7 +305,7 @@ impl ChatMessage {
         
         // Enhanced focus indicator
         let (line_prefix, line_color) = if is_focused {
-            ("│> ", Color::Yellow)  // Show a highlighted arrow for focused chunks
+            ("│▶ ", Color::Rgb(255, 165, 0))  // Orange arrow for focused chunks
         } else {
             ("│ ", base_style.fg.unwrap_or(Color::Reset))
         };
@@ -291,15 +314,17 @@ impl ChatMessage {
             ChunkType::Code(snippet) => {
                 let code_style = if is_focused {
                     Style::default()
-                        .fg(Color::Yellow)
-                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .bg(Color::Rgb(40, 40, 80))  // Dark blue background
                         .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
                 };
                 
                 let header_style = if is_focused {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Rgb(255, 215, 0))  // Gold color for code block header
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                 } else {
                     base_style
                 };
@@ -314,11 +339,24 @@ impl ChatMessage {
                 
                 // Code content
                 for code_line in snippet.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(indent.to_string(), base_style),
-                        Span::styled(if is_focused {"│| "} else {"│ "}, Style::default().fg(line_color)),
-                        Span::styled(code_line.to_string(), code_style),
-                    ]));
+                    // Add line numbers for code blocks when focused
+                    if is_focused {
+                        let line_num = code_line.len().min(3); // Just for visual effect, not real line numbers
+                        lines.push(Line::from(vec![
+                            Span::styled(indent.to_string(), base_style),
+                            Span::styled("│", Style::default().fg(line_color)),
+                            Span::styled(format!("{:>2}", line_num), Style::default().fg(Color::DarkGray)),
+                            Span::styled("│", Style::default().fg(line_color)),
+                            Span::styled(" ", Style::default()),
+                            Span::styled(code_line.to_string(), code_style),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(indent.to_string(), base_style),
+                            Span::styled("│ ", Style::default().fg(line_color)),
+                            Span::styled(code_line.to_string(), code_style),
+                        ]));
+                    }
                 }
                 
                 // Code block footer
@@ -331,7 +369,7 @@ impl ChatMessage {
             ChunkType::Text(text) => {
                 let text_style = if is_focused {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Rgb(50, 205, 50))  // Lime Green
                         .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
@@ -345,7 +383,10 @@ impl ChatMessage {
                 if is_focused && !is_empty {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("╭─── Text ───", Style::default().fg(Color::Yellow)),
+                        Span::styled("╭", Style::default().fg(Color::Rgb(70, 130, 180))), // Steel Blue
+                        Span::styled("━━━", Style::default().fg(Color::Rgb(70, 130, 180))),
+                        Span::styled(" TEXT ", Style::default().fg(Color::Rgb(135, 206, 250)).add_modifier(Modifier::BOLD)),
+                        Span::styled("━━━━━━━━━━━━━", Style::default().fg(Color::Rgb(70, 130, 180))),
                     ]));
                 }
                 
@@ -361,14 +402,15 @@ impl ChatMessage {
                 if is_focused && !is_empty {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("╰────────────", Style::default().fg(Color::Yellow)),
+                        Span::styled("╰", Style::default().fg(Color::Rgb(70, 130, 180))),
+                        Span::styled("━━━━━━━━━━━━━━━━━━━━━━━━", Style::default().fg(Color::Rgb(70, 130, 180))),
                     ]));
                 }
             }
             ChunkType::Steps(steps) => {
                 let step_style = if is_focused {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Rgb(255, 105, 180))  // Hot Pink
                         .add_modifier(Modifier::BOLD)
                 } else {
                     base_style
@@ -378,7 +420,10 @@ impl ChatMessage {
                 if is_focused && !steps.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("╭─── Steps ───", Style::default().fg(Color::Yellow)),
+                        Span::styled("╭", Style::default().fg(Color::Rgb(186, 85, 211))),  // Medium Orchid
+                        Span::styled("━━━", Style::default().fg(Color::Rgb(186, 85, 211))),
+                        Span::styled(" STEPS ", Style::default().fg(Color::Rgb(221, 160, 221)).add_modifier(Modifier::BOLD)),
+                        Span::styled("━━━━━━━━━━━", Style::default().fg(Color::Rgb(186, 85, 211))),
                     ]));
                 }
                 
@@ -386,7 +431,12 @@ impl ChatMessage {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
                         Span::styled(line_prefix, Style::default().fg(line_color)),
-                        Span::styled(format!("{}. ", i + 1), step_style),
+                        Span::styled(format!("{}. ", i + 1), 
+                            if is_focused { 
+                                Style::default().fg(Color::Rgb(255, 20, 147)) // Deep Pink for numbers
+                            } else { 
+                                step_style 
+                            }),
                         Span::styled(step.clone(), step_style),
                     ]));
                 }
@@ -395,7 +445,8 @@ impl ChatMessage {
                 if is_focused && !steps.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(indent.to_string(), base_style),
-                        Span::styled("╰─────────────", Style::default().fg(Color::Yellow)),
+                        Span::styled("╰", Style::default().fg(Color::Rgb(186, 85, 211))),
+                        Span::styled("━━━━━━━━━━━━━━━━━━━━━━━", Style::default().fg(Color::Rgb(186, 85, 211))),
                     ]));
                 }
             }

@@ -46,6 +46,19 @@ impl StatusIndicator {
             " "
         };
         
+        // Cycling colors for the spinner
+        let spinner_colors = [
+            Color::Rgb(255, 165, 0),   // Orange
+            Color::Rgb(255, 105, 180), // Hot Pink
+            Color::Rgb(50, 205, 50),   // Lime Green
+            Color::Rgb(30, 144, 255),  // Dodger Blue
+        ];
+        let spinner_color = if self.thinking {
+            spinner_colors[self.spinner_idx % spinner_colors.len()]
+        } else {
+            Color::DarkGray
+        };
+        
         // Always show status text if available, otherwise show thinking status
         let status_text = if !self.status_text.is_empty() {
             &self.status_text
@@ -57,15 +70,15 @@ impl StatusIndicator {
         
         // Choose the appropriate color for the status text
         let status_color = if self.thinking {
-            Color::DarkGray
+            Color::Rgb(150, 150, 150)  // Lighter gray for thinking
         } else if !self.status_text.is_empty() {
-            Color::Yellow
+            Color::Rgb(135, 206, 250)  // Light Sky Blue for navigation
         } else {
             Color::DarkGray
         };
         
         let status = Line::from(vec![
-            Span::styled(thinking_indicator, Style::default().fg(Color::Gray)),
+            Span::styled(thinking_indicator, Style::default().fg(spinner_color)),
             Span::raw(" "),
             Span::styled(status_text, Style::default().fg(status_color)),
         ]);
