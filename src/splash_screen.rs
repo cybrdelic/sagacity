@@ -12,6 +12,7 @@ pub enum SplashScreenAction {
     Quit,
     StartChat,
     DbDetails,
+    RunTests,
 }
 
 #[derive(Debug)]
@@ -24,7 +25,7 @@ impl SplashScreen {
     pub fn new() -> Self {
         Self {
             selected_idx: 0,
-            menu_items: vec!["Start Chat", "DB Details", "Quit"],
+            menu_items: vec!["Start Chat", "DB Details", "Run Tests", "Quit"],
         }
     }
 
@@ -118,6 +119,7 @@ impl SplashScreen {
                     "Quit" => Some(SplashScreenAction::Quit),
                     "Start Chat" => Some(SplashScreenAction::StartChat),
                     "DB Details" => Some(SplashScreenAction::DbDetails),
+                    "Run Tests" => Some(SplashScreenAction::RunTests),
                     _ => None,
                 }
             }
