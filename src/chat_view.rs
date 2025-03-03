@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use std::{error::Error, sync::Arc};
 use tokio::sync::Mutex;
 
-pub const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
-pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+// These constants are moved to api.rs
+pub use crate::api::{CLAUDE_API_URL, ANTHROPIC_VERSION};
 
 pub fn draw_chat(f: &mut Frame, app: &mut App) {
     let size = f.area();
@@ -205,9 +205,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
 
     {
         let mut guard = app.lock().await;
-        guard
-            .logs
-            .add("Sending request to Claude API...".to_string());
+        app.logs.add("Sending request to Claude API...".to_string());
 
         // Log a small snippet of the prompt to confirm what is being sent.
         let snippet = if final_prompt.len() > 120 {
@@ -215,7 +213,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         } else {
             final_prompt.clone()
         };
-        guard.logs.add(format!("Prompt snippet: \"{}\"", snippet));
+        app.logs.add(format!("Prompt snippet: \"{}\"", snippet));
     }
 
     // <<< CHANGED >>> Use final_prompt instead of `prompt`
