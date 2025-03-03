@@ -70,6 +70,11 @@ impl SagacityError {
     pub fn clipboard_error(message: impl Into<String>) -> Self {
         SagacityError::ClipboardError(message.into())
     }
+    
+    #[allow(dead_code)]
+    pub fn to_boxed<E: std::error::Error + Send + Sync + 'static>(err: E) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(err)
+    }
 
     pub fn user_message(&self) -> String {
         match self {
