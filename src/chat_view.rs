@@ -17,11 +17,22 @@ pub use crate::api::{CLAUDE_API_URL, ANTHROPIC_VERSION};
 
 pub fn draw_chat(f: &mut Frame, app: &mut App) {
     let size = f.area();
+    
+    // Updated layout to include context panel on the right
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
         .margin(1)
         .split(size);
+
+    // Split the right chunk into context and logs
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(horizontal_chunks[1]);
+    
+    let context_area = right_chunks[0];
+    let logs_area = right_chunks[1];
 
     let chat_vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -42,7 +53,12 @@ pub fn draw_chat(f: &mut Frame, app: &mut App) {
     app.status_indicator.render(f, chat_vertical_chunks[1]);
 
     draw_input(f, app, chat_vertical_chunks[2]);
-    draw_logs(f, app, horizontal_chunks[1], size);
+    
+    // Draw the context panel
+    draw_context(f, app, context_area);
+    
+    // Draw logs panel
+    draw_logs(f, app, logs_area, size);
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
@@ -167,22 +183,15 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     f.set_cursor_position((cursor_x, area.y + 1));
 }
 
-fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
-    let log_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(8)].as_ref())
-        .split(area);
-
-    let vsep = "│".repeat(size.height as usize - 2);
-    f.render_widget(
-        Paragraph::new(Span::raw(vsep)).style(Style::default().fg(Color::DarkGray)),
-        Rect {
-            x: area.x - 1,
-            y: 1,
-            width: 1,
-            height: size.height - 2,
-        },
-    );
+fn draw_logs(f: &mut Frame, app: &App, area: Rect, _size: Rect) {
+    // Create a block for the logs area
+    let logs_block = Block::default()
+        .title(" Logs ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    
+    let inner_area = logs_block.inner(area);
+    f.render_widget(logs_block, area);
 
     let log_lines: Vec<Line> = app
         .logs
@@ -197,7 +206,7 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
         .collect();
 
     let total_log_lines = log_lines.len() as u16;
-    let log_available_height = log_chunks[0].height;
+    let log_available_height = inner_area.height;
     let max_log_scroll = if total_log_lines > log_available_height {
         total_log_lines - log_available_height
     } else {
@@ -212,7 +221,111 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect, size: Rect) {
     let logs_para = Paragraph::new(log_lines)
         .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
-    f.render_widget(logs_para.scroll((logs_scroll, 0)), log_chunks[0]);
+    f.render_widget(logs_para.scroll((logs_scroll, 0)), inner_area);
+}
+
+/// Draws the context management panel showing which files are in context
+fn draw_context(f: &mut Frame, app: &mut App, area: Rect) {
+    // Create a block for the context area
+    let context_block = Block::default()
+        .title(" Context Files ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    
+    let inner_area = context_block.inner(area);
+    f.render_widget(context_block, area);
+    
+    // Header for context panel showing # files in context
+    let in_context_count = app.chatbot.context_entries.iter().filter(|e| e.in_context).count();
+    let total_count = app.chatbot.context_entries.len();
+    
+    let header_text = format!("{}/{} files in context | ↑/↓ navigate, Enter toggle", in_context_count, total_count);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(header_text, Style::default().fg(Color::Yellow))
+    ]));
+    
+    let header_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y,
+        width: inner_area.width,
+        height: 1,
+    };
+    
+    f.render_widget(header, header_area);
+    
+    // List context entries
+    let list_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y + 1,
+        width: inner_area.width,
+        height: inner_area.height - 1,
+    };
+    
+    let mut context_lines = Vec::new();
+    for (i, entry) in app.chatbot.context_entries.iter().enumerate() {
+        // Check if this entry is currently focused
+        let is_focused = app.focused_context_index == Some(i);
+        
+        // Format the file path to be more readable
+        let file_path = entry.file_path.clone();
+        
+        // Show icon based on whether the file is in context
+        let icon = if entry.in_context {
+            "▶ "
+        } else {
+            "  "
+        };
+        
+        // Set style based on focus and context status
+        let style = if is_focused {
+            // Highlighted when focused
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+        } else if entry.in_context {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        
+        // Format the score as a percentage
+        let score_pct = (entry.relevance_score * 100.0).round() as u8;
+        let score_text = format!(" {:3}%", score_pct);
+        
+        // Score color based on value
+        let score_style = if is_focused {
+            // Use same highlight style when focused
+            style 
+        } else if entry.relevance_score > 0.5 {
+            Style::default().fg(Color::Green)
+        } else if entry.relevance_score > 0.2 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        
+        context_lines.push(Line::from(vec![
+            Span::styled(icon, style),
+            Span::styled(file_path, style),
+            Span::styled(score_text, score_style),
+        ]));
+    }
+    
+    // Calculate scroll position based on focused item
+    if let Some(focused_idx) = app.focused_context_index {
+        let visible_items = list_area.height as usize;
+        if focused_idx >= app.context_scroll as usize + visible_items {
+            // Need to scroll down to show focused item
+            app.context_scroll = (focused_idx - visible_items + 1) as u16;
+        } else if focused_idx < app.context_scroll as usize {
+            // Need to scroll up to show focused item
+            app.context_scroll = focused_idx as u16;
+        }
+    }
+    
+    let context_para = Paragraph::new(context_lines)
+        .scroll((app.context_scroll, 0))
+        .wrap(Wrap { trim: true });
+    
+    f.render_widget(context_para, list_area);
 }
 
 pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
@@ -225,16 +338,27 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         guard.status_indicator.set_status("Thinking...");
     }
 
+    // Update context relevance scores based on the user query
+    {
+        let mut guard = app.lock().await;
+        // Update relevance scores
+        guard.chatbot.update_relevance_scores(&user_input);
+        guard.logs.add(format!(
+            "Updated context relevance scores for query: '{}'", 
+            if user_input.len() > 30 { 
+                format!("{}...", &user_input[0..30]) 
+            } else { 
+                user_input.clone() 
+            }
+        ));
+    }
+
+    // Get the context string from the selected files
     let context = {
         let guard = app.lock().await;
-        let mut ctx = String::new();
-        for (file, (summary, _)) in &guard.chatbot.index {
-            ctx.push_str(&format!("File: {}\nSummary: {}\n\n", file, summary));
-        }
-        ctx
+        guard.chatbot.get_context_string()
     };
 
-    // <<< ADDED >>>
     // Build a final prompt containing the codebase context and user question.
     let final_prompt = format!(
         "Based on this codebase context:\n{}\n\nAnswer this question: {}",

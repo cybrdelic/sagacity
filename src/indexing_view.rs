@@ -307,6 +307,12 @@ pub async fn indexing_task(app: Arc<Mutex<App>>) {
             }
         }
         guard.indexing_done = true;
+        
+        // Update context entries from the index
+        guard.chatbot.update_context_from_index();
+        let context_count = guard.chatbot.context_entries.len();
+        guard.logs.add(format!("Populated context with {} files", context_count));
+        
         guard.logs.add("Indexing complete!".to_string());
         guard.screen = AppScreen::Chat;
     }

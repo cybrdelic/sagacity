@@ -93,6 +93,9 @@ pub struct App {
     command_history: Vec<String>,
     command_index: Option<usize>,
     run_tests_on_startup: bool,
+    // Context management
+    focused_context_index: Option<usize>, // Currently selected context entry
+    context_scroll: u16,                  // Scroll position in context panel
 }
 
 impl App {
@@ -132,6 +135,8 @@ impl App {
             command_history,
             command_index: None,
             run_tests_on_startup,
+            focused_context_index: None,
+            context_scroll: 0,
         }
     }
     
@@ -229,6 +234,58 @@ impl App {
                 };
                 
                 let status = format!("{}{} | ←/→ to navigate chunks", msg_info, chunk_info);
+                self.status_indicator.set_status(status);
+            }
+        }
+    }
+    
+    // Context management functions
+    
+    // Navigate to the previous context entry
+    pub fn context_focus_prev(&mut self) {
+        match self.focused_context_index {
+            Some(idx) if idx > 0 => {
+                self.focused_context_index = Some(idx - 1);
+            }
+            None if !self.chatbot.context_entries.is_empty() => {
+                self.focused_context_index = Some(0);
+            }
+            _ => {}
+        }
+    }
+    
+    // Navigate to the next context entry
+    pub fn context_focus_next(&mut self) {
+        match self.focused_context_index {
+            Some(idx) if idx + 1 < self.chatbot.context_entries.len() => {
+                self.focused_context_index = Some(idx + 1);
+            }
+            None if !self.chatbot.context_entries.is_empty() => {
+                self.focused_context_index = Some(0);
+            }
+            _ => {}
+        }
+    }
+    
+    // Toggle whether the focused context entry is included in the context
+    pub fn toggle_focused_context_entry(&mut self) {
+        if let Some(idx) = self.focused_context_index {
+            self.chatbot.toggle_file_in_context(idx);
+        }
+    }
+    
+    // Show the context navigation and selection status
+    pub fn show_context_navigation_status(&mut self) {
+        if let Some(idx) = self.focused_context_index {
+            if idx < self.chatbot.context_entries.len() {
+                let entry = &self.chatbot.context_entries[idx];
+                let status = format!(
+                    "Context: {} [{}/{}] | {}",
+                    entry.file_path,
+                    idx + 1,
+                    self.chatbot.context_entries.len(),
+                    if entry.in_context { "In Context" } else { "Excluded" }
+                );
                 self.status_indicator.set_status(status);
             }
         }
@@ -453,6 +510,10 @@ async fn handle_chat_input(
             if app.input_mode == InputMode::Command {
                 app.input_mode = InputMode::Normal;
                 app.command_buffer.clear();
+            } else if app.focused_context_index.is_some() {
+                // Clear context focus first if it's set
+                app.focused_context_index = None;
+                app.status_indicator.clear_status();
             } else if app.focused_message_index.is_some() {
                 app.focused_message_index = None;
             } else {
@@ -460,6 +521,19 @@ async fn handle_chat_input(
             }
             // Reset command history navigation when exiting
             app.command_index = None;
+        }
+        // Context navigation with Alt+Up/Down and toggle with Alt+Enter
+        (KeyModifiers::ALT, KeyCode::Up) => {
+            app.context_focus_prev();
+            app.show_context_navigation_status();
+        }
+        (KeyModifiers::ALT, KeyCode::Down) => {
+            app.context_focus_next();
+            app.show_context_navigation_status();
+        }
+        (KeyModifiers::ALT, KeyCode::Enter) => {
+            app.toggle_focused_context_entry();
+            app.show_context_navigation_status();
         }
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if !app.chat_input.trim().is_empty() && !app.chat_thinking {
