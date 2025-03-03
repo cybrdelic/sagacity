@@ -3,7 +3,7 @@ use std::{
     error::Error,
     io,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 mod api;
@@ -23,24 +23,23 @@ mod status_indicator;
 mod test_view;
 
 use chat_message::ChatMessage;
-use copypasta::{ClipboardContext, ClipboardProvider};
+use copypasta::ClipboardProvider;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dotenv::var;
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use tokio::sync::Mutex;
+use serde::Serialize;
 
-// Import public constants from api module
-use crate::api::{ANTHROPIC_VERSION, CLAUDE_API_URL};
+// No longer needed to import API constants here
 
 use crate::{
-    chat_view::{draw_chat, simulate_chat_response},
+    chat_view::draw_chat,
     config::initialize_config,
     db::Db,
-    errors::{SagacityError, SagacityResult},
+    errors::SagacityError,
     indexing_view::{draw_indexing, indexing_task},
     models::{Chatbot, TreeNode},
     splash_screen::{SplashScreen, SplashScreenAction},
@@ -104,6 +103,9 @@ impl App {
         // Check if tests should run on startup
         let run_tests_on_startup = env::args().any(|arg| arg == "--run-tests");
         
+        // Load command history from file if it exists
+        let command_history = App::load_command_history().unwrap_or_default();
+        
         Self {
             screen: AppScreen::Splash,
             splash_screen: SplashScreen::new(),
@@ -127,12 +129,60 @@ impl App {
             db: None,
             db_path: "myriad_db.sqlite".to_string(),
             test_view: TestView::new(),
-            command_history: Vec::new(),
+            command_history,
             command_index: None,
             run_tests_on_startup,
         }
     }
-
+    
+    // Helper function to get the config directory
+    fn get_config_dir() -> std::path::PathBuf {
+        dirs::config_dir()
+            .map(|mut p| {
+                p.push("sagacity");
+                std::fs::create_dir_all(&p).ok();
+                p
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+    
+    // Save command history to a file
+    fn save_command_history(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.command_history.is_empty() {
+            return Ok(());
+        }
+        
+        let config_dir = Self::get_config_dir();
+        let history_path = config_dir.join("command_history.json");
+        
+        // Only save the last 100 commands
+        let history_to_save = if self.command_history.len() > 100 {
+            &self.command_history[self.command_history.len() - 100..]
+        } else {
+            &self.command_history
+        };
+        
+        let json = serde_json::to_string(history_to_save)?;
+        std::fs::write(history_path, json)?;
+        
+        Ok(())
+    }
+    
+    // Load command history from file
+    fn load_command_history() -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        let config_dir = Self::get_config_dir();
+        let history_path = config_dir.join("command_history.json");
+        
+        if !history_path.exists() {
+            return Ok(Vec::new());
+        }
+        
+        let json = std::fs::read_to_string(history_path)?;
+        let history: Vec<String> = serde_json::from_str(&json)?;
+        
+        Ok(history)
+    }
+    
     pub fn get_focused_message(&mut self) -> Option<&mut ChatMessage> {
         self.logs.add("getting focused message".to_string());
         if let Some(index) = self.focused_message_index {
@@ -203,7 +253,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let res = run_app(&mut terminal, app.clone()).await;
     
     // Handle terminal restoration
-    if let Err(e) = restore_terminal(&mut terminal) {
+    let app_guard = app.lock().await;
+    if let Err(e) = restore_terminal(&mut terminal, &app_guard) {
         eprintln!("Failed to restore terminal: {}", e);
         return Err(e);
     }
@@ -225,7 +276,13 @@ fn setup_terminal() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Save command history before exiting
+    if let Err(e) = app.save_command_history() {
+        eprintln!("Failed to save command history: {}", e);
+    }
+    
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -347,6 +404,14 @@ async fn handle_db_details_input(
     Ok(false)
 }
 
+/// Handles keyboard input for the chat screen
+/// 
+/// Features:
+/// - Command history navigation with Ctrl+Up and Ctrl+Down arrows
+/// - Visual indicator when browsing history
+/// - Persistent command history across sessions
+/// - History length limitation (max 100 entries)
+/// - Up/Down arrows preserved for message navigation
 async fn handle_chat_input(
     app: &mut App,
     key: crossterm::event::KeyEvent,
@@ -363,17 +428,34 @@ async fn handle_chat_input(
             } else {
                 app.screen = AppScreen::Splash;
             }
+            // Reset command history navigation when exiting
+            app.command_index = None;
         }
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if !app.chat_input.trim().is_empty() && !app.chat_thinking {
                 let input = app.chat_input.clone();
                 app.chat_messages.push(ChatMessage::new(input.clone(), true));
+                
+                // Add to command history if not empty and not a duplicate of the last command
+                if !app.command_history.is_empty() && app.command_history.last() != Some(&input) {
+                    app.command_history.push(input.clone());
+                } else if app.command_history.is_empty() {
+                    app.command_history.push(input.clone());
+                }
+                
+                // Limit history size (optional)
+                if app.command_history.len() > 100 {
+                    app.command_history.remove(0);
+                }
+                
                 app.chat_input.clear();
                 app.focused_message_index = None;
+                // Reset command history navigation
+                app.command_index = None;
                 
                 let app_clone = app_arc.clone();
                 tokio::spawn(async move {
-                    chat_view::simulate_chat_response(app_clone, input).await;
+                    crate::chat_view::simulate_chat_response(app_clone, input).await;
                 });
             }
         }
@@ -383,10 +465,13 @@ async fn handle_chat_input(
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.chat_input.clear();
         }
+        // Normal message navigation with Up/Down arrows (without modifier)
         (KeyModifiers::NONE, KeyCode::Up) => {
-            if let Some(idx) = app.focused_message_index {
-                if idx > 0 {
-                    app.focused_message_index = Some(idx - 1);
+            if app.focused_message_index.is_some() {
+                if let Some(idx) = app.focused_message_index {
+                    if idx > 0 {
+                        app.focused_message_index = Some(idx - 1);
+                    }
                 }
             } else if !app.chat_messages.is_empty() {
                 app.focused_message_index = Some(app.chat_messages.len() - 1);
@@ -401,6 +486,37 @@ async fn handle_chat_input(
                 }
             }
         }
+        // Command history navigation with Ctrl+Up and Ctrl+Down
+        (KeyModifiers::CONTROL, KeyCode::Up) => {
+            if !app.command_history.is_empty() {
+                match app.command_index {
+                    None => {
+                        // First press of Ctrl+Up, go to the most recent command
+                        app.command_index = Some(app.command_history.len() - 1);
+                        app.chat_input = app.command_history[app.command_history.len() - 1].clone();
+                    }
+                    Some(idx) if idx > 0 => {
+                        // Navigate to earlier commands
+                        app.command_index = Some(idx - 1);
+                        app.chat_input = app.command_history[idx - 1].clone();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (KeyModifiers::CONTROL, KeyCode::Down) => {
+            if let Some(idx) = app.command_index {
+                if idx < app.command_history.len() - 1 {
+                    // Navigate to later commands
+                    app.command_index = Some(idx + 1);
+                    app.chat_input = app.command_history[idx + 1].clone();
+                } else {
+                    // At the end of history, clear input and reset index
+                    app.command_index = None;
+                    app.chat_input.clear();
+                }
+            }
+        }
         (KeyModifiers::NONE, KeyCode::PageUp) => {
             if app.chat_scroll > 0 {
                 app.chat_scroll = app.chat_scroll.saturating_sub(10);
@@ -411,6 +527,8 @@ async fn handle_chat_input(
         }
         (KeyModifiers::NONE, KeyCode::Char(c)) => {
             app.chat_input.push(c);
+            // Reset command history navigation when typing
+            app.command_index = None;
         }
         _ => {}
     }

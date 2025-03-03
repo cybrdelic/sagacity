@@ -89,8 +89,21 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
+    // Show history indicator prefix when navigating command history
+    let prefix = if app.command_index.is_some() {
+        "⌃ "  // Changed to Ctrl symbol to reflect Ctrl+Up/Down usage
+    } else {
+        "→ "
+    };
+    
+    let prefix_style = if app.command_index.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    
     let input = Line::from(vec![
-        Span::styled("→ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(prefix, prefix_style),
         Span::styled(&app.chat_input, Style::default().fg(Color::White)),
     ]);
 
@@ -111,6 +124,31 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             height: area.height - 2,
         },
     );
+
+    // Add a history mode indicator when browsing history
+    if app.command_index.is_some() {
+        let history_idx = app.command_index.unwrap() + 1;
+        let history_len = app.command_history.len();
+        let history_text = format!(" [Ctrl History {}/{}] ", history_idx, history_len);
+        
+        let history_indicator = Paragraph::new(Line::from(Span::styled(
+            history_text.clone(),
+            Style::default().fg(Color::Yellow).bg(Color::Black),
+        )));
+        
+        let indicator_width = history_text.len() as u16;
+        let indicator_x = area.x + area.width - indicator_width;
+        
+        f.render_widget(
+            history_indicator,
+            Rect {
+                x: indicator_x,
+                y: area.y + 1,
+                width: indicator_width,
+                height: 1,
+            },
+        );
+    }
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(

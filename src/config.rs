@@ -2,7 +2,6 @@ use crate::errors::{SagacityError, SagacityResult};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf, sync::RwLock};
-use dirs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
