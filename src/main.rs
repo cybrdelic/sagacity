@@ -161,15 +161,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Initialize configuration
     if let Err(e) = initialize_config() {
-        eprintln!("Failed to initialize configuration: {}", e);
-        return Err(Box::new(SagacityError::config_error(format!("Configuration initialization failed: {}", e))));
+        eprintln!("Failed to initialize configuration: {:?}", e);
+        return Err(Box::<dyn Error + Send + Sync>::from(e));
     }
 
     // Initialize flexi_logger to write logs to a file.
-    Logger::try_with_str("info")?
+    if let Err(e) = Logger::try_with_str("info")
+        .map_err(|e| format!("Logger error: {}", e))?
         .write_mode(WriteMode::BufferAndFlush)
         .log_to_file(FileSpec::default())
-        .start()?;
+        .start() {
+        return Err(Box::<dyn Error + Send + Sync>::from(format!("Logger start error: {}", e)));
+    }
 
     setup_terminal()?;
 
@@ -180,7 +183,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize database
     {
         let mut guard = app.lock().await;
-        let db_instance = Db::init(&guard.db_path).await?;
+        let db_instance = match Db::init(&guard.db_path).await {
+            Ok(db) => db,
+            Err(e) => return Err(Box::<dyn Error + Send + Sync>::from(format!("Database initialization error: {}", e))),
+        };
         guard.db = Some(db_instance);
         guard.logs.add("db initialized successfully".to_string());
         
@@ -195,10 +201,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let res = run_app(&mut terminal, app.clone()).await;
-    restore_terminal(&mut terminal)?;
+    
+    // Handle terminal restoration
+    if let Err(e) = restore_terminal(&mut terminal) {
+        eprintln!("Failed to restore terminal: {}", e);
+        return Err(e);
+    }
 
+    // Handle application errors
     if let Err(err) = res {
         eprintln!("application error: {}", err);
+        return Err(err);
     }
 
     Ok(())
@@ -330,6 +343,76 @@ async fn handle_db_details_input(
         app.logs
             .add("exiting db details screen, returning to chat".to_string());
         app.screen = AppScreen::Chat;
+    }
+    Ok(false)
+}
+
+async fn handle_chat_input(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    app_arc: Arc<Mutex<App>>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            if app.input_mode == InputMode::Command {
+                app.input_mode = InputMode::Normal;
+                app.command_buffer.clear();
+            } else if app.focused_message_index.is_some() {
+                app.focused_message_index = None;
+            } else {
+                app.screen = AppScreen::Splash;
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            if !app.chat_input.trim().is_empty() && !app.chat_thinking {
+                let input = app.chat_input.clone();
+                app.chat_messages.push(ChatMessage::new(input.clone(), true));
+                app.chat_input.clear();
+                app.focused_message_index = None;
+                
+                let app_clone = app_arc.clone();
+                tokio::spawn(async move {
+                    chat_view::simulate_chat_response(app_clone, input).await;
+                });
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Backspace) => {
+            app.chat_input.pop();
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+            app.chat_input.clear();
+        }
+        (KeyModifiers::NONE, KeyCode::Up) => {
+            if let Some(idx) = app.focused_message_index {
+                if idx > 0 {
+                    app.focused_message_index = Some(idx - 1);
+                }
+            } else if !app.chat_messages.is_empty() {
+                app.focused_message_index = Some(app.chat_messages.len() - 1);
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Down) => {
+            if let Some(idx) = app.focused_message_index {
+                if idx < app.chat_messages.len() - 1 {
+                    app.focused_message_index = Some(idx + 1);
+                } else {
+                    app.focused_message_index = None;
+                }
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::PageUp) => {
+            if app.chat_scroll > 0 {
+                app.chat_scroll = app.chat_scroll.saturating_sub(10);
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::PageDown) => {
+            app.chat_scroll = app.chat_scroll.saturating_add(10);
+        }
+        (KeyModifiers::NONE, KeyCode::Char(c)) => {
+            app.chat_input.push(c);
+        }
+        _ => {}
     }
     Ok(false)
 }
