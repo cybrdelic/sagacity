@@ -205,7 +205,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
 
     {
         let mut guard = app.lock().await;
-        app.logs.add("Sending request to Claude API...".to_string());
+        guard.logs.add("Sending request to Claude API...".to_string());
 
         // Log a small snippet of the prompt to confirm what is being sent.
         let snippet = if final_prompt.len() > 120 {
@@ -213,7 +213,7 @@ pub async fn simulate_chat_response(app: Arc<Mutex<App>>, user_input: String) {
         } else {
             final_prompt.clone()
         };
-        app.logs.add(format!("Prompt snippet: \"{}\"", snippet));
+        guard.logs.add(format!("Prompt snippet: \"{}\"", snippet));
     }
 
     // <<< CHANGED >>> Use final_prompt instead of `prompt`
