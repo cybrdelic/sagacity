@@ -2,7 +2,6 @@ use crate::{
     config::get_config,
     errors::{SagacityError, SagacityResult},
 };
-use claude_tokenizer::ClaudeTokenizer;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use reqwest::Client;
@@ -13,12 +12,12 @@ use std::sync::Mutex;
 pub const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-// Token counter
-static TOKENIZER: Lazy<ClaudeTokenizer> = Lazy::new(ClaudeTokenizer::new);
+// Token counter - temporarily commented out until we can set up claude-tokenizer properly
+// static TOKENIZER: Lazy<ClaudeTokenizer> = Lazy::new(ClaudeTokenizer::new);
 
 // Response cache
 static API_CACHE: Lazy<Mutex<LruCache<String, ApiResponse>>> =
-    Lazy::new(|| Mutex::new(LruCache::new(100)));
+    Lazy::new(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap())));
 
 #[derive(Debug, Clone)]
 pub struct TokenUsage {
@@ -52,9 +51,11 @@ pub async fn get_claude_response(
     let mut messages = history.to_vec();
     messages.push(json!({ "role": "user", "content": user_input }));
     let messages_json = serde_json::to_string(&messages)?;
-    let token_count = TOKENIZER.count_tokens(&messages_json);
     
-    if token_count > config.token_limit_threshold {
+    // Temporary placeholder until we can properly implement token counting
+    let token_count = messages_json.len() / 4; // Rough approximation
+    
+    if token_count > config.token_limit_threshold as usize {
         return Err(SagacityError::token_error(format!(
             "Input exceeds token limit threshold: {} tokens (limit: {})",
             token_count, config.token_limit_threshold
@@ -80,12 +81,13 @@ pub async fn get_claude_response(
         .await
         .map_err(|e| SagacityError::api_error(format!("Request failed: {}", e)))?;
 
-    // Check for API errors
-    if !response.status().is_success() {
+    // Check for API errors and clone the status for error reporting
+    let status = response.status();
+    if !status.is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(SagacityError::api_error(format!(
             "API returned error: {} - {}",
-            response.status(),
+            status,
             error_text
         )));
     }
@@ -149,9 +151,11 @@ pub async fn summarize_file(
         "please analyze this {} code and provide a brief summary of its purpose and functionality.\n\ncode:\n{}",
         language, content
     );
-    let token_count = TOKENIZER.count_tokens(&prompt);
     
-    if token_count > config.token_limit_threshold {
+    // Temporary placeholder until we can properly implement token counting
+    let token_count = prompt.len() / 4; // Rough approximation
+    
+    if token_count > config.token_limit_threshold as usize {
         return Err(SagacityError::token_error(format!(
             "File too large to summarize: {} tokens (limit: {})",
             token_count, config.token_limit_threshold
@@ -177,12 +181,13 @@ pub async fn summarize_file(
         .await
         .map_err(|e| SagacityError::api_error(format!("Request failed: {}", e)))?;
 
-    // Check for API errors
-    if !response.status().is_success() {
+    // Check for API errors and clone the status for error reporting
+    let status = response.status();
+    if !status.is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(SagacityError::api_error(format!(
             "API returned error: {} - {}",
-            response.status(),
+            status,
             error_text
         )));
     }
