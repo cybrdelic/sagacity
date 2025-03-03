@@ -3,7 +3,7 @@ use crate::App;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
@@ -105,7 +105,7 @@ impl TestView {
         };
     }
 
-    pub fn run_all_tests(&mut self) -> SagacityResult<()> {
+    pub fn run_all_tests(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.running {
             return Ok(());
         }
@@ -146,7 +146,7 @@ impl TestView {
 }
 
 pub fn draw_test_view(f: &mut Frame, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
 
     // Create the layout
     let chunks = Layout::default()
@@ -157,14 +157,14 @@ pub fn draw_test_view(f: &mut Frame, app: &mut App) {
 
     // Draw the header
     let header_text = vec![
-        Spans::from(Span::styled(
+        Line::from(vec![Span::styled(
             "Sagacity Test Runner",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-        Spans::from(Span::styled(
+        )]),
+        Line::from(vec![Span::styled(
             app.test_view.get_summary(),
             Style::default().fg(Color::White),
-        )),
+        )]),
     ];
 
     let header = Paragraph::new(header_text)
@@ -192,7 +192,7 @@ pub fn draw_test_view(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::White)
             };
 
-            let spans = Spans::from(vec![
+            let line = Line::from(vec![
                 Span::styled(format!("[{}] ", test.status.as_str()), status_style),
                 Span::styled(&test.name, name_style),
                 Span::styled(
@@ -200,7 +200,7 @@ pub fn draw_test_view(f: &mut Frame, app: &mut App) {
                     Style::default().fg(Color::Gray),
                 ),
             ]);
-            ListItem::new(spans)
+            ListItem::new(line)
         })
         .collect();
 
@@ -214,25 +214,25 @@ pub fn draw_test_view(f: &mut Frame, app: &mut App) {
     // Draw the test details
     let details = if let Some(test) = app.test_view.get_selected_test() {
         let text = Text::from(vec![
-            Spans::from(Span::styled(
+            Line::from(vec![Span::styled(
                 format!("Test: {}", test.name),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-            Spans::from(Span::styled(
+            )]),
+            Line::from(vec![Span::styled(
                 format!("Status: {}", test.status.as_str()),
                 Style::default().fg(test.status.color()),
-            )),
-            Spans::from(Span::styled(
+            )]),
+            Line::from(vec![Span::styled(
                 format!("Duration: {} ms", test.duration_ms),
                 Style::default().fg(Color::White),
-            )),
-            Spans::from(Span::raw("")),
-            Spans::from(Span::styled(
+            )]),
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![Span::styled(
                 "Output:",
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-            Spans::from(Span::raw("")),
-            Spans::from(Span::raw(&test.output)),
+            )]),
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![Span::raw(&test.output)]),
         ]);
 
         Paragraph::new(text).block(
@@ -302,7 +302,7 @@ pub async fn run_tests(app_arc: Arc<Mutex<App>>) {
             let mut guard = app_arc.lock().await;
             let (status, output) = match result {
                 Ok((status, output)) => (status, output),
-                Err(e) => (TestStatus::Failed, format!("Error: {}", e)),
+                Err(e) => (TestStatus::Failed, format!("Error: {:?}", e)),
             };
 
             let duration = rand::random::<u64>() % 1000 + 50; // Simulate random duration
@@ -319,7 +319,7 @@ pub async fn run_tests(app_arc: Arc<Mutex<App>>) {
     }
 }
 
-async fn run_api_connection_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_api_connection_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate API connection test
     let api_key = std::env::var("ANTHROPIC_API_KEY");
     if api_key.is_err() {
@@ -335,7 +335,7 @@ async fn run_api_connection_test() -> SagacityResult<(TestStatus, String)> {
     ))
 }
 
-async fn run_file_indexing_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_file_indexing_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate file indexing test
     Ok((
         TestStatus::Passed,
@@ -343,7 +343,7 @@ async fn run_file_indexing_test() -> SagacityResult<(TestStatus, String)> {
     ))
 }
 
-async fn run_database_operations_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_database_operations_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate database operations test
     Ok((
         TestStatus::Passed,
@@ -351,7 +351,7 @@ async fn run_database_operations_test() -> SagacityResult<(TestStatus, String)> 
     ))
 }
 
-async fn run_chat_functionality_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_chat_functionality_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate chat functionality test
     Ok((
         TestStatus::Passed,
@@ -359,7 +359,7 @@ async fn run_chat_functionality_test() -> SagacityResult<(TestStatus, String)> {
     ))
 }
 
-async fn run_error_handling_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_error_handling_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate error handling test
     Ok((
         TestStatus::Passed,
@@ -367,7 +367,7 @@ async fn run_error_handling_test() -> SagacityResult<(TestStatus, String)> {
     ))
 }
 
-async fn run_config_validation_test() -> SagacityResult<(TestStatus, String)> {
+async fn run_config_validation_test() -> Result<(TestStatus, String), Box<dyn std::error::Error + Send + Sync>> {
     // Simulate config validation test
     Ok((
         TestStatus::Passed,
