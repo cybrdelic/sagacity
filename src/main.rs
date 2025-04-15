@@ -3,7 +3,7 @@ use std::{
     error::Error,
     io,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 mod api;
@@ -22,25 +22,24 @@ mod splash_screen;
 mod status_indicator;
 mod test_view;
 
-use chat_message::ChatMessage;
-use copypasta::{ClipboardContext, ClipboardProvider};
+use chat_message::{ChatMessage, ChunkType};
+use copypasta::ClipboardProvider;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dotenv::var;
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use tokio::sync::Mutex;
+use serde::Serialize;
 
-// Import public constants from api module
-use crate::api::{ANTHROPIC_VERSION, CLAUDE_API_URL};
+// No longer needed to import API constants here
 
 use crate::{
-    chat_view::{draw_chat, simulate_chat_response},
+    chat_view::draw_chat,
     config::initialize_config,
     db::Db,
-    errors::{SagacityError, SagacityResult},
+    errors::SagacityError,
     indexing_view::{draw_indexing, indexing_task},
     models::{Chatbot, TreeNode},
     splash_screen::{SplashScreen, SplashScreenAction},
@@ -94,6 +93,9 @@ pub struct App {
     command_history: Vec<String>,
     command_index: Option<usize>,
     run_tests_on_startup: bool,
+    // Context management
+    focused_context_index: Option<usize>, // Currently selected context entry
+    context_scroll: u16,                  // Scroll position in context panel
 }
 
 impl App {
@@ -103,6 +105,9 @@ impl App {
         
         // Check if tests should run on startup
         let run_tests_on_startup = env::args().any(|arg| arg == "--run-tests");
+        
+        // Load command history from file if it exists
+        let command_history = App::load_command_history().unwrap_or_default();
         
         Self {
             screen: AppScreen::Splash,
@@ -127,12 +132,62 @@ impl App {
             db: None,
             db_path: "myriad_db.sqlite".to_string(),
             test_view: TestView::new(),
-            command_history: Vec::new(),
+            command_history,
             command_index: None,
             run_tests_on_startup,
+            focused_context_index: None,
+            context_scroll: 0,
         }
     }
-
+    
+    // Helper function to get the config directory
+    fn get_config_dir() -> std::path::PathBuf {
+        dirs::config_dir()
+            .map(|mut p| {
+                p.push("sagacity");
+                std::fs::create_dir_all(&p).ok();
+                p
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+    
+    // Save command history to a file
+    fn save_command_history(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.command_history.is_empty() {
+            return Ok(());
+        }
+        
+        let config_dir = Self::get_config_dir();
+        let history_path = config_dir.join("command_history.json");
+        
+        // Only save the last 100 commands
+        let history_to_save = if self.command_history.len() > 100 {
+            &self.command_history[self.command_history.len() - 100..]
+        } else {
+            &self.command_history
+        };
+        
+        let json = serde_json::to_string(history_to_save)?;
+        std::fs::write(history_path, json)?;
+        
+        Ok(())
+    }
+    
+    // Load command history from file
+    fn load_command_history() -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        let config_dir = Self::get_config_dir();
+        let history_path = config_dir.join("command_history.json");
+        
+        if !history_path.exists() {
+            return Ok(Vec::new());
+        }
+        
+        let json = std::fs::read_to_string(history_path)?;
+        let history: Vec<String> = serde_json::from_str(&json)?;
+        
+        Ok(history)
+    }
+    
     pub fn get_focused_message(&mut self) -> Option<&mut ChatMessage> {
         self.logs.add("getting focused message".to_string());
         if let Some(index) = self.focused_message_index {
@@ -152,6 +207,88 @@ impl App {
             self.chat_messages.len(),
             self.chat_scroll
         ));
+    }
+    
+    pub fn show_message_navigation_status(&mut self) {
+        if let Some(msg_idx) = self.focused_message_index {
+            if let Some(message) = self.chat_messages.get(msg_idx) {
+                let msg_info = if self.chat_messages.len() > 1 {
+                    format!("Message {}/{}", msg_idx + 1, self.chat_messages.len())
+                } else {
+                    "Message 1/1".to_string()
+                };
+                
+                let chunk_info = if let Some(chunk_idx) = message.focused_chunk {
+                    if message.chunks.len() > 1 {
+                        let chunk_type = match &message.chunks[chunk_idx].content {
+                            ChunkType::Code(_) => "Code Block",
+                            ChunkType::Text(_) => "Text Block",
+                            ChunkType::Steps(_) => "Steps Block",
+                        };
+                        format!(" | {} {}/{}", chunk_type, chunk_idx + 1, message.chunks.len())
+                    } else {
+                        "".to_string()
+                    }
+                } else {
+                    "".to_string()
+                };
+                
+                let status = format!("{}{} | ←/→ to navigate chunks", msg_info, chunk_info);
+                self.status_indicator.set_status(status);
+            }
+        }
+    }
+    
+    // Context management functions
+    
+    // Navigate to the previous context entry
+    pub fn context_focus_prev(&mut self) {
+        match self.focused_context_index {
+            Some(idx) if idx > 0 => {
+                self.focused_context_index = Some(idx - 1);
+            }
+            None if !self.chatbot.context_entries.is_empty() => {
+                self.focused_context_index = Some(0);
+            }
+            _ => {}
+        }
+    }
+    
+    // Navigate to the next context entry
+    pub fn context_focus_next(&mut self) {
+        match self.focused_context_index {
+            Some(idx) if idx + 1 < self.chatbot.context_entries.len() => {
+                self.focused_context_index = Some(idx + 1);
+            }
+            None if !self.chatbot.context_entries.is_empty() => {
+                self.focused_context_index = Some(0);
+            }
+            _ => {}
+        }
+    }
+    
+    // Toggle whether the focused context entry is included in the context
+    pub fn toggle_focused_context_entry(&mut self) {
+        if let Some(idx) = self.focused_context_index {
+            self.chatbot.toggle_file_in_context(idx);
+        }
+    }
+    
+    // Show the context navigation and selection status
+    pub fn show_context_navigation_status(&mut self) {
+        if let Some(idx) = self.focused_context_index {
+            if idx < self.chatbot.context_entries.len() {
+                let entry = &self.chatbot.context_entries[idx];
+                let status = format!(
+                    "Context: {} [{}/{}] | {}",
+                    entry.file_path,
+                    idx + 1,
+                    self.chatbot.context_entries.len(),
+                    if entry.in_context { "In Context" } else { "Excluded" }
+                );
+                self.status_indicator.set_status(status);
+            }
+        }
     }
 }
 
@@ -203,7 +340,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let res = run_app(&mut terminal, app.clone()).await;
     
     // Handle terminal restoration
-    if let Err(e) = restore_terminal(&mut terminal) {
+    let app_guard = app.lock().await;
+    if let Err(e) = restore_terminal(&mut terminal, &app_guard) {
         eprintln!("Failed to restore terminal: {}", e);
         return Err(e);
     }
@@ -225,7 +363,13 @@ fn setup_terminal() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Save command history before exiting
+    if let Err(e) = app.save_command_history() {
+        eprintln!("Failed to save command history: {}", e);
+    }
+    
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -347,6 +491,14 @@ async fn handle_db_details_input(
     Ok(false)
 }
 
+/// Handles keyboard input for the chat screen
+/// 
+/// Features:
+/// - Command history navigation with Ctrl+Up and Ctrl+Down arrows
+/// - Visual indicator when browsing history
+/// - Persistent command history across sessions
+/// - History length limitation (max 100 entries)
+/// - Up/Down arrows preserved for message navigation
 async fn handle_chat_input(
     app: &mut App,
     key: crossterm::event::KeyEvent,
@@ -358,22 +510,56 @@ async fn handle_chat_input(
             if app.input_mode == InputMode::Command {
                 app.input_mode = InputMode::Normal;
                 app.command_buffer.clear();
+            } else if app.focused_context_index.is_some() {
+                // Clear context focus first if it's set
+                app.focused_context_index = None;
+                app.status_indicator.clear_status();
             } else if app.focused_message_index.is_some() {
                 app.focused_message_index = None;
             } else {
                 app.screen = AppScreen::Splash;
             }
+            // Reset command history navigation when exiting
+            app.command_index = None;
+        }
+        // Context navigation with Alt+Up/Down and toggle with Alt+Enter
+        (KeyModifiers::ALT, KeyCode::Up) => {
+            app.context_focus_prev();
+            app.show_context_navigation_status();
+        }
+        (KeyModifiers::ALT, KeyCode::Down) => {
+            app.context_focus_next();
+            app.show_context_navigation_status();
+        }
+        (KeyModifiers::ALT, KeyCode::Enter) => {
+            app.toggle_focused_context_entry();
+            app.show_context_navigation_status();
         }
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if !app.chat_input.trim().is_empty() && !app.chat_thinking {
                 let input = app.chat_input.clone();
                 app.chat_messages.push(ChatMessage::new(input.clone(), true));
+                
+                // Add to command history if not empty and not a duplicate of the last command
+                if !app.command_history.is_empty() && app.command_history.last() != Some(&input) {
+                    app.command_history.push(input.clone());
+                } else if app.command_history.is_empty() {
+                    app.command_history.push(input.clone());
+                }
+                
+                // Limit history size (optional)
+                if app.command_history.len() > 100 {
+                    app.command_history.remove(0);
+                }
+                
                 app.chat_input.clear();
                 app.focused_message_index = None;
+                // Reset command history navigation
+                app.command_index = None;
                 
                 let app_clone = app_arc.clone();
                 tokio::spawn(async move {
-                    chat_view::simulate_chat_response(app_clone, input).await;
+                    crate::chat_view::simulate_chat_response(app_clone, input).await;
                 });
             }
         }
@@ -383,21 +569,78 @@ async fn handle_chat_input(
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.chat_input.clear();
         }
+        // Normal message navigation with Up/Down arrows (without modifier)
         (KeyModifiers::NONE, KeyCode::Up) => {
-            if let Some(idx) = app.focused_message_index {
-                if idx > 0 {
-                    app.focused_message_index = Some(idx - 1);
+            if app.focused_message_index.is_some() {
+                if let Some(idx) = app.focused_message_index {
+                    if idx > 0 {
+                        app.focused_message_index = Some(idx - 1);
+                        app.show_message_navigation_status();
+                    }
                 }
             } else if !app.chat_messages.is_empty() {
                 app.focused_message_index = Some(app.chat_messages.len() - 1);
+                app.show_message_navigation_status();
             }
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
             if let Some(idx) = app.focused_message_index {
                 if idx < app.chat_messages.len() - 1 {
                     app.focused_message_index = Some(idx + 1);
+                    app.show_message_navigation_status();
                 } else {
                     app.focused_message_index = None;
+                    app.status_indicator.clear_status();
+                }
+            }
+        }
+        // Within-message chunk navigation using Left/Right arrows
+        (KeyModifiers::NONE, KeyCode::Left) => {
+            if let Some(idx) = app.focused_message_index {
+                if let Some(message) = app.chat_messages.get_mut(idx) {
+                    message.focus_previous();
+                    app.logs.add(format!("Focused previous chunk in message {}", idx));
+                    app.show_message_navigation_status();
+                }
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Right) => {
+            if let Some(idx) = app.focused_message_index {
+                if let Some(message) = app.chat_messages.get_mut(idx) {
+                    message.focus_next();
+                    app.logs.add(format!("Focused next chunk in message {}", idx));
+                    app.show_message_navigation_status();
+                }
+            }
+        }
+        // Command history navigation with Ctrl+Up and Ctrl+Down
+        (KeyModifiers::CONTROL, KeyCode::Up) => {
+            if !app.command_history.is_empty() {
+                match app.command_index {
+                    None => {
+                        // First press of Ctrl+Up, go to the most recent command
+                        app.command_index = Some(app.command_history.len() - 1);
+                        app.chat_input = app.command_history[app.command_history.len() - 1].clone();
+                    }
+                    Some(idx) if idx > 0 => {
+                        // Navigate to earlier commands
+                        app.command_index = Some(idx - 1);
+                        app.chat_input = app.command_history[idx - 1].clone();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (KeyModifiers::CONTROL, KeyCode::Down) => {
+            if let Some(idx) = app.command_index {
+                if idx < app.command_history.len() - 1 {
+                    // Navigate to later commands
+                    app.command_index = Some(idx + 1);
+                    app.chat_input = app.command_history[idx + 1].clone();
+                } else {
+                    // At the end of history, clear input and reset index
+                    app.command_index = None;
+                    app.chat_input.clear();
                 }
             }
         }
@@ -411,6 +654,8 @@ async fn handle_chat_input(
         }
         (KeyModifiers::NONE, KeyCode::Char(c)) => {
             app.chat_input.push(c);
+            // Reset command history navigation when typing
+            app.command_index = None;
         }
         _ => {}
     }
